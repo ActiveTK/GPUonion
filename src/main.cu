@@ -42,20 +42,25 @@
     } while (0)
 
 #define MAX_RESULTS 16
+#define MAX_PREFIXES 256
 
 /* ---------------- device constants ---------------- */
 __constant__ uint8_t c_a0[32];
-__constant__ uint8_t c_target[32];
-__constant__ uint8_t c_mask[32];
-__constant__ int c_mlen;
+/* up to MAX_PREFIXES independent target/mask patterns; a candidate matches
+   the search as soon as it satisfies any one of them */
+__constant__ int c_nprefixes;
+__constant__ uint8_t c_target[MAX_PREFIXES][32];
+__constant__ uint8_t c_mask[MAX_PREFIXES][32];
+__constant__ int c_mlen[MAX_PREFIXES];
 __constant__ ge25519 c_base; /* B */
 /* step point S = (8*T)*B in cached affine form for mixed addition */
 __constant__ fe c_stepp;   /* Sy + Sx  */
 __constant__ fe c_stepm;   /* Sy - Sx  */
 __constant__ fe c_step2dt; /* 2d*Sx*Sy */
-/* fast compare: prefix bits that fall into limb 0 of y (bits 0..50) */
-__constant__ uint64_t c_t0;
-__constant__ uint64_t c_m0;
+/* fast compare: prefix bits that fall into limb 0 of y (bits 0..50), one pair
+   per prefix pattern */
+__constant__ uint64_t c_t0[MAX_PREFIXES];
+__constant__ uint64_t c_m0[MAX_PREFIXES];
 /* Montgomery x-only stepping: u(S)+1, u(S)-1, and -S (Edwards ext.) for init */
 __constant__ fe c_msp;
 __constant__ fe c_msm;
@@ -67,7 +72,21 @@ __constant__ fe4 c_mk4;
 struct FoundRec {
     uint32_t tid;
     uint32_t iter;
+    uint32_t pfx; /* which prefix pattern (index into c_target/c_mask) matched */
 };
+
+/* full byte-level check against prefix pattern `p` (needed only for prefixes
+   > 10 chars; also rules out the ~2^-50 limb0 false positives) */
+__device__ __forceinline__ bool prefix_full_match(const uint8_t pk[32], int p)
+{
+    int mlen = c_mlen[p];
+#pragma unroll 1
+    for (int j = 0; j < mlen; j++) {
+        if ((pk[j] ^ c_target[p][j]) & c_mask[p][j])
+            return false;
+    }
+    return true;
+}
 
 /* thread state for Montgomery x-only stepping: projective u of P_k and P_{k-1}
    (u = (1+y)/(1-y) = (Z+Y)/(Z-Y) maps Edwards y to Curve25519 u) */
@@ -229,23 +248,25 @@ __global__ void k_search(ge25519* pts, uint32_t nthreads, uint32_t nbatch,
                 fe_copy(zi, inv);
             }
             fe_mul(y, Ys[k], zi);
-            if (((y[0] ^ c_t0) & c_m0) == 0) {
-                /* full byte-level check (needed only for prefixes > 10 chars;
-                   also rules out the ~2^-50 limb0 false positives) */
+            uint64_t y0 = y[0];
+            bool any_quick = false;
+            for (int p = 0; p < c_nprefixes; p++) {
+                if (((y0 ^ c_t0[p]) & c_m0[p]) == 0) {
+                    any_quick = true;
+                    break;
+                }
+            }
+            if (any_quick) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
-                bool ok = true;
-                for (int j = 0; j < c_mlen; j++) {
-                    if ((pk[j] ^ c_target[j]) & c_mask[j]) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    uint32_t idx = atomicAdd(found_count, 1);
-                    if (idx < MAX_RESULTS) {
-                        found[idx].tid = t;
-                        found[idx].iter = iter_base + b * BATCH + k;
+                for (int p = 0; p < c_nprefixes; p++) {
+                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                        uint32_t idx = atomicAdd(found_count, 1);
+                        if (idx < MAX_RESULTS) {
+                            found[idx].tid = t;
+                            found[idx].iter = iter_base + b * BATCH + k;
+                            found[idx].pfx = p;
+                        }
                     }
                 }
             }
@@ -308,21 +329,25 @@ __global__ void k_search_mont(MontState* st, uint32_t nthreads, uint32_t nbatch,
                 fe_copy(zi, inv);
             }
             fe_mul(y, Ns[k], zi);
-            if (((y[0] ^ c_t0) & c_m0) == 0) {
+            uint64_t y0 = y[0];
+            bool any_quick = false;
+            for (int p = 0; p < c_nprefixes; p++) {
+                if (((y0 ^ c_t0[p]) & c_m0[p]) == 0) {
+                    any_quick = true;
+                    break;
+                }
+            }
+            if (any_quick) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
-                bool ok = true;
-                for (int j = 0; j < c_mlen; j++) {
-                    if ((pk[j] ^ c_target[j]) & c_mask[j]) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    uint32_t idx = atomicAdd(found_count, 1);
-                    if (idx < MAX_RESULTS) {
-                        found[idx].tid = t;
-                        found[idx].iter = iter_base + b * BATCH + k;
+                for (int p = 0; p < c_nprefixes; p++) {
+                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                        uint32_t idx = atomicAdd(found_count, 1);
+                        if (idx < MAX_RESULTS) {
+                            found[idx].tid = t;
+                            found[idx].iter = iter_base + b * BATCH + k;
+                            found[idx].pfx = p;
+                        }
                     }
                 }
             }
@@ -389,29 +414,31 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
                 fe4_mul(inv, inv, Ds[k]);
             /* y is lazy: value is y_true + j*p for j in {0,1,2}, and limb 0 of
                y_true is then y[0] + 19j (mod 2^64). Cheap triple compare keeps
-               canonicalization off the hot path. */
+               canonicalization off the hot path; checked against every
+               prefix pattern before paying for fe4_canon. */
             uint64_t y0 = y[0];
-            bool maybe = (((y0 ^ c_t0) & c_m0) == 0) ||
-                         ((((y0 + 19) ^ c_t0) & c_m0) == 0) ||
-                         ((((y0 + 38) ^ c_t0) & c_m0) == 0);
+            bool maybe = false;
+            for (int p = 0; p < c_nprefixes; p++) {
+                uint64_t t0 = c_t0[p], m0 = c_m0[p];
+                if ((((y0 ^ t0) & m0) == 0) || ((((y0 + 19) ^ t0) & m0) == 0) ||
+                    ((((y0 + 38) ^ t0) & m0) == 0)) {
+                    maybe = true;
+                    break;
+                }
+            }
             if (maybe) {
                 fe4_canon(y);
-            }
-            if (maybe && ((y[0] ^ c_t0) & c_m0) == 0) {
+                y0 = y[0];
                 uint8_t pk[32];
                 fe4_tobytes(pk, y);
-                bool ok = true;
-                for (int j = 0; j < c_mlen; j++) {
-                    if ((pk[j] ^ c_target[j]) & c_mask[j]) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    uint32_t idx = atomicAdd(found_count, 1);
-                    if (idx < MAX_RESULTS) {
-                        found[idx].tid = t;
-                        found[idx].iter = iter_base + b * BATCH + k;
+                for (int p = 0; p < c_nprefixes; p++) {
+                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                        uint32_t idx = atomicAdd(found_count, 1);
+                        if (idx < MAX_RESULTS) {
+                            found[idx].tid = t;
+                            found[idx].iter = iter_base + b * BATCH + k;
+                            found[idx].pfx = p;
+                        }
                     }
                 }
             }
@@ -727,10 +754,11 @@ static bool selftest()
    serializes stdout/stderr writes so lines from different GPUs don't
    interleave mid-line. */
 struct RunConfig {
-    std::string pfx;
-    uint8_t target[32];
-    uint8_t mask[32];
-    int mlen;
+    std::vector<std::string> prefixes;
+    uint8_t target[MAX_PREFIXES][32];
+    uint8_t mask[MAX_PREFIXES][32];
+    int mlen[MAX_PREFIXES];
+    int nprefixes;
     int tpb_arg;
     int blocks_arg;
     uint32_t iters;
@@ -827,25 +855,30 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     fe_copy(stepneg.Z, step.Z);
     fe_neg(stepneg.T, step.T);
 
-    /* prefix bits that live in limb 0 of y (bits 0..50) for the fast compare */
-    uint64_t m0 = 0, t0 = 0;
-    for (int i = 7; i >= 0; i--) {
-        m0 = (m0 << 8) | cfg.mask[i];
-        t0 = (t0 << 8) | cfg.target[i];
+    /* prefix bits that live in limb 0 of y (bits 0..50) for the fast compare,
+       one pair per prefix pattern */
+    uint64_t m0[MAX_PREFIXES], t0[MAX_PREFIXES];
+    for (int p = 0; p < cfg.nprefixes; p++) {
+        uint64_t mm = 0, tt = 0;
+        for (int i = 7; i >= 0; i--) {
+            mm = (mm << 8) | cfg.mask[p][i];
+            tt = (tt << 8) | cfg.target[p][i];
+        }
+        m0[p] = mm & FE_M51;
+        t0[p] = tt & FE_M51;
     }
-    m0 &= FE_M51;
-    t0 &= FE_M51;
 
     CUDA_CHECK(cudaMemcpyToSymbol(c_a0, a0, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mask, cfg.mask, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, &cfg.mlen, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_nprefixes, &cfg.nprefixes, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mask, cfg.mask, sizeof(cfg.mask)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, cfg.mlen, sizeof(cfg.mlen)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_base, &hostB, sizeof(ge25519)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepp, stepp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepm, stepm, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_step2dt, step2dt, sizeof(fe)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_t0, &t0, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_m0, &m0, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_t0, t0, sizeof(uint64_t) * cfg.nprefixes));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_m0, m0, sizeof(uint64_t) * cfg.nprefixes));
     CUDA_CHECK(cudaMemcpyToSymbol(c_msp, msp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_msm, msm, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepneg, &stepneg, sizeof(ge25519)));
@@ -994,7 +1027,10 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                 result_scalar(sc, a0, recs[r].tid, recs[r].iter, T);
                 host_pubkey(pk, sc);
                 std::string addr = onion_address(pk);
-                if (addr.compare(0, cfg.pfx.size(), cfg.pfx) != 0) {
+                const std::string* matched = (recs[r].pfx < cfg.prefixes.size())
+                                                  ? &cfg.prefixes[recs[r].pfx]
+                                                  : nullptr;
+                if (!matched || addr.compare(0, matched->size(), *matched) != 0) {
                     std::lock_guard<std::mutex> lk(out_mtx);
                     fprintf(stderr, "WARNING: candidate failed host verification (%s), skipped\n",
                             addr.c_str());
@@ -1036,9 +1072,12 @@ static void usage(const char* argv0)
 {
     fprintf(stderr,
             "GPUonion - Tor v3 onion vanity address generator (CUDA)\n"
-            "usage: %s <prefix> [options]\n"
+            "usage: %s <prefix> [<prefix> ...] [options]\n"
             "       %s -b [options]\n"
-            "  <prefix>       base32 prefix to search for (chars a-z 2-7)\n"
+            "  <prefix>       base32 prefix(es) to search for (chars a-z 2-7).\n"
+            "                 pass more than one (as separate args and/or comma-\n"
+            "                 separated) to match any of them; the first hit wins.\n"
+            "                 up to %d prefixes, max 30 chars each.\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
             "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
             "                 a single index, or a comma list e.g. \"0,1,2\".\n"
@@ -1055,12 +1094,13 @@ static void usage(const char* argv0)
             "  --ext          use Edwards extended-coordinate stepping (slower; for A/B)\n"
             "  --selftest     run internal tests only\n",
             argv0,
-            argv0);
+            argv0,
+            MAX_PREFIXES);
 }
 
 int main(int argc, char** argv)
 {
-    const char* prefix = nullptr;
+    std::vector<std::string> prefix_args; /* raw positional args, may still hold comma lists */
     std::string device_arg = "all"; /* single index, comma list ("0,1"), or "all" (default) */
     int tpb = 0, blocks = 0, batch = 512;
     uint32_t iters = 1024;
@@ -1083,7 +1123,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--m51")) mode = 1;
         else if (!strcmp(argv[i], "--ext")) mode = 2;
-        else if (argv[i][0] != '-' && !prefix) prefix = argv[i];
+        else if (argv[i][0] != '-') prefix_args.push_back(argv[i]);
         else {
             usage(argv[0]);
             return 1;
@@ -1098,26 +1138,57 @@ int main(int argc, char** argv)
         printf("selftest OK\n");
         return 0;
     }
-    if (!prefix && !benchmark) {
+    if (prefix_args.empty() && !benchmark) {
         usage(argv[0]);
         return 1;
     }
 
+    /* split each positional arg on ',' so "-d foo,bar" style comma lists
+       work alongside plain separate arguments */
+    std::vector<std::string> raw_prefixes;
+    for (const auto& a : prefix_args) {
+        size_t pos = 0;
+        while (pos <= a.size()) {
+            size_t comma = a.find(',', pos);
+            std::string tok = a.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                        : comma - pos);
+            if (!tok.empty())
+                raw_prefixes.push_back(tok);
+            if (comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+    }
+
     /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
        match) so the per-candidate work is identical to a real search */
-    if (benchmark && !prefix)
-        prefix = "bench234bench234";
+    if (benchmark && raw_prefixes.empty())
+        raw_prefixes.push_back("bench234bench234");
 
-    /* normalize + validate prefix */
-    std::string pfx = prefix;
-    for (auto& ch : pfx)
-        if (ch >= 'A' && ch <= 'Z')
-            ch += 32;
-    uint8_t target[32], mask[32];
-    int mlen = prefix_to_mask(pfx.c_str(), target, mask);
-    if (mlen < 0 || pfx.empty() || pfx.size() > 30) {
-        fprintf(stderr, "invalid prefix '%s' (allowed: a-z 2-7, max 30 chars)\n", pfx.c_str());
+    if ((int)raw_prefixes.size() > MAX_PREFIXES) {
+        fprintf(stderr, "too many prefixes (%zu, max %d)\n", raw_prefixes.size(), MAX_PREFIXES);
         return 1;
+    }
+
+    /* normalize + validate each prefix */
+    RunConfig cfg{};
+    cfg.nprefixes = (int)raw_prefixes.size();
+    for (int p = 0; p < cfg.nprefixes; p++) {
+        std::string pfx = raw_prefixes[p];
+        for (auto& ch : pfx)
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 32;
+        uint8_t target[32], mask[32];
+        int mlen = prefix_to_mask(pfx.c_str(), target, mask);
+        if (mlen < 0 || pfx.empty() || pfx.size() > 30) {
+            fprintf(stderr, "invalid prefix '%s' (allowed: a-z 2-7, max 30 chars)\n",
+                    pfx.c_str());
+            return 1;
+        }
+        memcpy(cfg.target[p], target, 32);
+        memcpy(cfg.mask[p], mask, 32);
+        cfg.mlen[p] = mlen;
+        cfg.prefixes.push_back(pfx);
     }
 
     if (batch != 8 && batch != 16 && batch != 32 && batch != 64 && batch != 128 &&
@@ -1161,11 +1232,6 @@ int main(int argc, char** argv)
         }
     }
 
-    RunConfig cfg;
-    cfg.pfx = pfx;
-    memcpy(cfg.target, target, 32);
-    memcpy(cfg.mask, mask, 32);
-    cfg.mlen = mlen;
     cfg.tpb_arg = tpb;
     cfg.blocks_arg = blocks;
     cfg.iters = iters;
@@ -1176,7 +1242,12 @@ int main(int argc, char** argv)
     cfg.benchmark = benchmark;
     cfg.bench_secs = bench_secs;
 
-    double expected = pow(32.0, (double)pfx.size());
+    /* combined match probability across all prefixes (treated as mutually
+       exclusive, which holds unless prefixes overlap each other) */
+    double prob_sum = 0.0;
+    for (const auto& s : cfg.prefixes)
+        prob_sum += pow(32.0, -(double)s.size());
+    double expected = prob_sum > 0.0 ? 1.0 / prob_sum : 0.0;
 
     /* combined startup banner: group devices with identical name/SM count so
        a large fleet prints one line, not one block of text per GPU */
@@ -1211,10 +1282,17 @@ int main(int argc, char** argv)
         }
         printf("\n");
 
-        if (benchmark)
+        if (benchmark) {
             printf("mode    : benchmark (~%.0f s)\n", bench_secs);
-        else
-            printf("prefix  : %s (expected ~%.3g keys per match)\n", pfx.c_str(), expected);
+        } else if (cfg.prefixes.size() == 1) {
+            printf("prefix  : %s (expected ~%.3g keys per match)\n", cfg.prefixes[0].c_str(),
+                   expected);
+        } else {
+            printf("prefixes: %zu patterns, any match wins (expected ~%.3g keys per match)\n",
+                   cfg.prefixes.size(), expected);
+            for (const auto& s : cfg.prefixes)
+                printf("            %s\n", s.c_str());
+        }
 
         uint32_t nb = (iters + (uint32_t)batch - 1) / (uint32_t)batch;
         if (nb == 0)
