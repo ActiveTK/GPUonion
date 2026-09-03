@@ -75,6 +75,27 @@ __constant__ uint64_t c_m0[MAX_PREFIXES];
    sentinel); c_bucket_idx holds prefix indices grouped by bucket. */
 __constant__ int c_bucket_start[33];
 __constant__ int c_bucket_idx[MAX_PREFIXES];
+/* Bloom prefilter over the shortest configured prefix.
+   The bucket scan above is fine for a handful of patterns but collapses at
+   scale: the bucket is chosen from the candidate's own leading character, so
+   threads in a warp read different constant-memory addresses and those loads
+   serialize 32 ways, and with 1000 prefixes over 32 buckets each scan still
+   walks ~31 patterns. Every real match must agree with some pattern on the
+   bits of the shortest prefix, so hash those bits and test two bits of a
+   64Kbit Bloom filter kept in shared memory: one uniform, non-divergent probe
+   rejects ~99.9% of candidates in constant time no matter how many prefixes
+   are configured. Survivors fall through to the exact bucket scan. */
+#define BLOOM_LOG2_BITS 16
+#define BLOOM_BITS (1u << BLOOM_LOG2_BITS)
+#define BLOOM_WORDS (BLOOM_BITS >> 5) /* 2048 words = 8 KB of shared memory */
+/* mask of the bits every pattern constrains (AND of all c_m0), i.e. the bits
+   of the shortest prefix - the only bits the filter may key on */
+__constant__ uint64_t c_bloom_mask;
+/* 0 for small prefix sets, where the direct bucket scan is already cheaper
+   than staging the table into shared memory */
+__constant__ uint32_t c_use_bloom;
+__device__ uint32_t g_bloom[BLOOM_WORDS];
+
 /* Montgomery x-only stepping: u(S)+1, u(S)-1, and -S (Edwards ext.) for init */
 __constant__ fe c_msp;
 __constant__ fe c_msm;
@@ -116,6 +137,56 @@ __device__ __forceinline__ bool bucket_quick_any(uint64_t y0)
             return true;
     }
     return false;
+}
+
+/* 32-bit finalizer (murmur-style). Folding the 51-bit key to 32 bits first
+   keeps this to cheap 32-bit multiplies; collisions among a few thousand
+   patterns in 2^32 are far below the filter's own false-positive rate. Shared
+   by host (table build) and device (probe) so the two can never disagree. */
+__host__ __device__ __forceinline__ uint32_t bloom_hash(uint64_t key)
+{
+    uint32_t x = (uint32_t)key ^ (uint32_t)(key >> 32);
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+/* the two bit positions pattern/candidate `key` sets or tests */
+__host__ __device__ __forceinline__ void bloom_slots(uint64_t key, uint32_t& i1, uint32_t& i2)
+{
+    uint32_t h = bloom_hash(key);
+    i1 = h & (BLOOM_BITS - 1);
+    i2 = (h >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
+}
+
+__device__ __forceinline__ bool bloom_probe(const uint32_t* __restrict__ tbl, uint64_t y0)
+{
+    uint32_t i1, i2;
+    bloom_slots(y0 & c_bloom_mask, i1, i2);
+    return ((tbl[i1 >> 5] >> (i1 & 31)) & (tbl[i2 >> 5] >> (i2 & 31)) & 1u) != 0;
+}
+
+/* hot-path reject: Bloom probe when the prefix set is big enough to warrant
+   the table, plain bucket scan otherwise (c_use_bloom is grid-uniform, so the
+   branch costs nothing) */
+__device__ __forceinline__ bool quick_any(const uint32_t* __restrict__ bloom, uint64_t y0)
+{
+    return c_use_bloom ? bloom_probe(bloom, y0) : bucket_quick_any(y0);
+}
+
+/* stage g_bloom into shared memory once per block; a no-op when the filter is
+   off, in which case the launch requests no dynamic shared memory at all and
+   occupancy is exactly what it was before */
+__device__ __forceinline__ void bloom_load(uint32_t* bloom)
+{
+    if (c_use_bloom) {
+        for (uint32_t i = threadIdx.x; i < BLOOM_WORDS; i += blockDim.x)
+            bloom[i] = g_bloom[i];
+    }
+    __syncthreads();
 }
 
 /* thread state for Montgomery x-only stepping: projective u of P_k and P_{k-1}
@@ -246,6 +317,9 @@ template <int BATCH>
 __global__ void k_search(ge25519* pts, uint32_t nthreads, uint32_t nbatch,
                          uint32_t iter_base, uint32_t* found_count, FoundRec* found)
 {
+    extern __shared__ uint32_t s_bloom[];
+    bloom_load(s_bloom);
+
     uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nthreads)
         return;
@@ -279,7 +353,7 @@ __global__ void k_search(ge25519* pts, uint32_t nthreads, uint32_t nbatch,
             }
             fe_mul(y, Ys[k], zi);
             uint64_t y0 = y[0];
-            if (bucket_quick_any(y0)) {
+            if (quick_any(s_bloom, y0)) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
                 int bk = (int)((y0 >> 3) & 0x1F);
@@ -309,6 +383,9 @@ template <int BATCH>
 __global__ void k_search_mont(MontState* st, uint32_t nthreads, uint32_t nbatch,
                               uint32_t iter_base, uint32_t* found_count, FoundRec* found)
 {
+    extern __shared__ uint32_t s_bloom[];
+    bloom_load(s_bloom);
+
     uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nthreads)
         return;
@@ -356,7 +433,7 @@ __global__ void k_search_mont(MontState* st, uint32_t nthreads, uint32_t nbatch,
             }
             fe_mul(y, Ns[k], zi);
             uint64_t y0 = y[0];
-            if (bucket_quick_any(y0)) {
+            if (quick_any(s_bloom, y0)) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
                 int bk = (int)((y0 >> 3) & 0x1F);
@@ -385,6 +462,9 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
                                uint32_t iter_base, uint32_t* __restrict__ found_count,
                                FoundRec* __restrict__ found)
 {
+    extern __shared__ uint32_t s_bloom[];
+    bloom_load(s_bloom);
+
     uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nthreads)
         return;
@@ -435,26 +515,13 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
             if (k > 0)
                 fe4_mul(inv, inv, Ds[k]);
             /* y is lazy: value is y_true + j*p for j in {0,1,2}, and limb 0 of
-               y_true is then y[0] + 19j (mod 2^64). The offset also shifts
-               which bucket (first base32 char) the true value falls into, so
-               each of the 3 candidate values gets its own bucket lookup -
-               still only a handful of prefix checks total, not c_nprefixes
-               times 3, and canonicalization stays off the hot path. */
+               y_true is then y[0] + 19j (mod 2^64). The offset changes the
+               hashed key, so each of the 3 candidate values needs its own
+               probe - six shared-memory loads total, still constant work, and
+               canonicalization stays off the hot path. */
             uint64_t y0 = y[0];
-            uint64_t yv[3] = { y0, y0 + 19, y0 + 38 };
-            bool maybe = false;
-#pragma unroll
-            for (int j = 0; j < 3 && !maybe; j++) {
-                int bk = (int)((yv[j] >> 3) & 0x1F);
-                int end = c_bucket_start[bk + 1];
-                for (int i = c_bucket_start[bk]; i < end; i++) {
-                    int p = c_bucket_idx[i];
-                    if (((yv[j] ^ c_t0[p]) & c_m0[p]) == 0) {
-                        maybe = true;
-                        break;
-                    }
-                }
-            }
+            bool maybe = quick_any(s_bloom, y0) | quick_any(s_bloom, y0 + 19) |
+                         quick_any(s_bloom, y0 + 38);
             if (maybe) {
                 fe4_canon(y);
                 uint64_t yc = y[0];
@@ -1008,6 +1075,30 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
             bucket_idx[cursor[(cfg.target[p][0] >> 3) & 0x1F]++] = p;
     }
 
+    /* Bloom filter over the bits every pattern constrains. bloom_mask is the
+       AND of all the per-pattern limb-0 masks, which (masks being nested by
+       prefix length) is exactly the mask of the shortest configured prefix,
+       so a candidate that misses the filter cannot match any pattern. Only
+       worth its shared-memory staging once the bucket scan gets long. */
+    uint64_t bloom_mask = ~0ull;
+    for (int p = 0; p < cfg.nprefixes; p++)
+        bloom_mask &= m0[p];
+    uint32_t use_bloom = (cfg.nprefixes > 8 && bloom_mask != 0) ? 1u : 0u;
+    std::vector<uint32_t> bloom(BLOOM_WORDS, 0u);
+    if (use_bloom) {
+        for (int p = 0; p < cfg.nprefixes; p++) {
+            uint32_t i1, i2;
+            bloom_slots(t0[p] & bloom_mask, i1, i2);
+            bloom[i1 >> 5] |= 1u << (i1 & 31);
+            bloom[i2 >> 5] |= 1u << (i2 & 31);
+        }
+    }
+    const size_t search_shmem = use_bloom ? sizeof(uint32_t) * BLOOM_WORDS : 0;
+
+    CUDA_CHECK(cudaMemcpyToSymbol(c_bloom_mask, &bloom_mask, sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_use_bloom, &use_bloom, sizeof(uint32_t)));
+    if (use_bloom)
+        CUDA_CHECK(cudaMemcpyToSymbol(g_bloom, bloom.data(), sizeof(uint32_t) * BLOOM_WORDS));
     CUDA_CHECK(cudaMemcpyToSymbol(c_a0, a0, 32));
     CUDA_CHECK(cudaMemcpyToSymbol(c_nprefixes, &cfg.nprefixes, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
@@ -1102,36 +1193,36 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         if (mode == 0) {
             MontState4* p = (MontState4*)d_state;
             switch (batch) {
-            case 8:  k_search_mont4<8><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 16: k_search_mont4<16><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 32: k_search_mont4<32><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 64: k_search_mont4<64><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 128: k_search_mont4<128><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 256: k_search_mont4<256><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 512: k_search_mont4<512><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 1024: k_search_mont4<1024><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 8:  k_search_mont4<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 16: k_search_mont4<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 32: k_search_mont4<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 64: k_search_mont4<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 128: k_search_mont4<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 256: k_search_mont4<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 512: k_search_mont4<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 1024: k_search_mont4<1024><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
             }
         } else if (mode == 2) {
             ge25519* p = (ge25519*)d_state;
             switch (batch) {
-            case 8:  k_search<8><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 16: k_search<16><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 32: k_search<32><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 64: k_search<64><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 128: k_search<128><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 256: k_search<256><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 512: k_search<512><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 8:  k_search<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 16: k_search<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 32: k_search<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 64: k_search<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 128: k_search<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 256: k_search<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 512: k_search<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
             }
         } else {
             MontState* p = (MontState*)d_state;
             switch (batch) {
-            case 8:  k_search_mont<8><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 16: k_search_mont<16><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 32: k_search_mont<32><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 64: k_search_mont<64><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 128: k_search_mont<128><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 256: k_search_mont<256><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
-            case 512: k_search_mont<512><<<blocks, tpb>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 8:  k_search_mont<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 16: k_search_mont<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 32: k_search_mont<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 64: k_search_mont<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 128: k_search_mont<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 256: k_search_mont<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+            case 512: k_search_mont<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
             }
         }
         CUDA_CHECK(cudaGetLastError());
