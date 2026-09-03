@@ -832,6 +832,7 @@ struct RunConfig {
     int want;
     bool benchmark;
     double bench_secs;
+    bool keep_forever; /* --keep-working-until-ctrlc: never stop on match count */
 };
 
 /* threads-per-block / blocks-per-grid a device will actually launch with,
@@ -1085,7 +1086,7 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         iter_base = launch_iters;
     }
 
-    while (cfg.benchmark || global_found.load() < cfg.want) {
+    while (cfg.benchmark || cfg.keep_forever || global_found.load() < cfg.want) {
         if (iter_base + launch_iters > 0xFFFFFFFFull) {
             std::lock_guard<std::mutex> lk(out_mtx);
             fprintf(stderr, "device %d: iteration counter exhausted; restart with a new seed\n",
@@ -1105,7 +1106,7 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
             CUDA_CHECK(cudaMemcpy(recs, d_found, sizeof(FoundRec) * nn, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemset(d_count, 0, sizeof(uint32_t)));
 
-            for (uint32_t r = 0; r < nn && global_found.load() < cfg.want; r++) {
+            for (uint32_t r = 0; r < nn && (cfg.keep_forever || global_found.load() < cfg.want); r++) {
                 uint8_t sc[32], pk[32];
                 result_scalar(sc, a0, recs[r].tid, recs[r].iter, T);
                 host_pubkey(pk, sc);
@@ -1175,6 +1176,9 @@ static void usage(const char* argv0)
             "                 selected GPUs (default 1) - with multiple prefixes\n"
             "                 the default already stops at the first hit, no\n"
             "                 matter which pattern in the list it matched\n"
+            "  --keep-working-until-ctrlc\n"
+            "                 ignore -n and keep searching (saving every match)\n"
+            "                 until interrupted (Ctrl+C)\n"
             "  -o <dir>       output directory (default ./found)\n"
             "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
             "  -t <threads>   threads per block (default 256)\n"
@@ -1200,6 +1204,7 @@ int main(int argc, char** argv)
     std::string outdir = "found";
     bool selftest_only = false;
     bool benchmark = false;
+    bool keep_forever = false;
     const double bench_secs = 20.0;
 
     for (int i = 1; i < argc; i++) {
@@ -1207,6 +1212,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bench")) benchmark = true;
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) device_arg = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--keep-working-until-ctrlc")) keep_forever = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) tpb = atoi(argv[++i]);
@@ -1344,6 +1350,7 @@ int main(int argc, char** argv)
     cfg.want = want;
     cfg.benchmark = benchmark;
     cfg.bench_secs = bench_secs;
+    cfg.keep_forever = keep_forever;
 
     /* combined match probability across all prefixes (treated as mutually
        exclusive, which holds unless prefixes overlap each other) */
