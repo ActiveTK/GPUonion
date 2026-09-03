@@ -477,6 +477,44 @@ static std::string hex(const uint8_t* b, size_t n)
     return s;
 }
 
+/* Reads prefixes from a file, one per line (blank lines skipped, surrounding
+   whitespace and CR/LF trimmed). Each line is validated immediately so a bad
+   entry is reported with its file + line number rather than surfacing later
+   mixed in with prefixes from other sources. Appends onto `out` (lower-
+   cased). Returns false (after printing an error) if the file can't be
+   opened or any non-blank line is not a valid prefix. */
+static bool load_prefixes_from_file(const std::string& path, std::vector<std::string>& out)
+{
+    std::ifstream f(path);
+    if (!f) {
+        fprintf(stderr, "cannot open prefix file '%s'\n", path.c_str());
+        return false;
+    }
+    std::string line;
+    int lineno = 0;
+    while (std::getline(f, line)) {
+        lineno++;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos)
+            continue; /* blank line */
+        line = line.substr(start);
+        for (auto& ch : line)
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 32;
+        uint8_t target[32], mask[32];
+        int mlen = prefix_to_mask(line.c_str(), target, mask);
+        if (mlen < 0 || line.size() > 30) {
+            fprintf(stderr, "invalid prefix '%s' at %s:%d (allowed: a-z 2-7, max 30 chars)\n",
+                    line.c_str(), path.c_str(), lineno);
+            return false;
+        }
+        out.push_back(line);
+    }
+    return true;
+}
+
 /* human-readable key rate: switches unit prefix so the number stays 3-4 digits */
 static std::string format_rate(double keys_per_sec)
 {
@@ -1078,13 +1116,20 @@ static void usage(const char* argv0)
             "                 pass more than one (as separate args and/or comma-\n"
             "                 separated) to match any of them; the first hit wins.\n"
             "                 up to %d prefixes, max 30 chars each.\n"
+            "  --prefix-from-file <path>\n"
+            "                 also read prefixes from a file, one per line (blank\n"
+            "                 lines skipped). Combined with any given on the command\n"
+            "                 line. Every line is validated up front; an invalid one\n"
+            "                 aborts with its file:line before any GPU work starts.\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
             "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
             "                 a single index, or a comma list e.g. \"0,1,2\".\n"
             "                 Each GPU runs fully independently in its own host\n"
             "                 thread (own random start point, own output).\n"
             "  -n <count>     stop after this many matches, summed across all\n"
-            "                 selected GPUs (default 1)\n"
+            "                 selected GPUs (default 1) - with multiple prefixes\n"
+            "                 the default already stops at the first hit, no\n"
+            "                 matter which pattern in the list it matched\n"
             "  -o <dir>       output directory (default ./found)\n"
             "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
             "  -t <threads>   threads per block (default 256)\n"
@@ -1101,6 +1146,7 @@ static void usage(const char* argv0)
 int main(int argc, char** argv)
 {
     std::vector<std::string> prefix_args; /* raw positional args, may still hold comma lists */
+    std::string prefix_file; /* --prefix-from-file: one prefix per line */
     std::string device_arg = "all"; /* single index, comma list ("0,1"), or "all" (default) */
     int tpb = 0, blocks = 0, batch = 512;
     uint32_t iters = 1024;
@@ -1123,6 +1169,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "-B") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--m51")) mode = 1;
         else if (!strcmp(argv[i], "--ext")) mode = 2;
+        else if (!strcmp(argv[i], "--prefix-from-file") && i + 1 < argc) prefix_file = argv[++i];
         else if (argv[i][0] != '-') prefix_args.push_back(argv[i]);
         else {
             usage(argv[0]);
@@ -1138,7 +1185,7 @@ int main(int argc, char** argv)
         printf("selftest OK\n");
         return 0;
     }
-    if (prefix_args.empty() && !benchmark) {
+    if (prefix_args.empty() && prefix_file.empty() && !benchmark) {
         usage(argv[0]);
         return 1;
     }
@@ -1160,10 +1207,21 @@ int main(int argc, char** argv)
         }
     }
 
+    /* --prefix-from-file adds to (not replaces) anything given on the
+       command line; each line is validated as it's read, so a bad entry is
+       reported with its file:line before any GPU work starts */
+    if (!prefix_file.empty() && !load_prefixes_from_file(prefix_file, raw_prefixes))
+        return 1;
+
     /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
        match) so the per-candidate work is identical to a real search */
     if (benchmark && raw_prefixes.empty())
         raw_prefixes.push_back("bench234bench234");
+
+    if (raw_prefixes.empty() && !benchmark) {
+        fprintf(stderr, "no prefixes given (check --prefix-from-file contents)\n");
+        return 1;
+    }
 
     if ((int)raw_prefixes.size() > MAX_PREFIXES) {
         fprintf(stderr, "too many prefixes (%zu, max %d)\n", raw_prefixes.size(), MAX_PREFIXES);
