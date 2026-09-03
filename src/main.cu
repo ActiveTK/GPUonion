@@ -743,8 +743,17 @@ struct RunConfig {
     bool multi; /* true when >1 device runs concurrently (affects formatting) */
 };
 
+/* benchmark outcome for one GPU, filled in just before the worker returns;
+   the caller aggregates these across all devices once every thread has
+   joined, so the final speed/expected-time summary reflects combined
+   throughput instead of one block per GPU */
+struct BenchResult {
+    uint64_t keys = 0;
+    double elapsed = 0.0;
+};
+
 static void run_device(int device, const RunConfig& cfg, std::atomic<int>& global_found,
-                       std::mutex& out_mtx)
+                       std::mutex& out_mtx, BenchResult* bench_out)
 {
     char tagbuf[16] = {0};
     if (cfg.multi)
@@ -1019,21 +1028,9 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         auto now = std::chrono::steady_clock::now();
         double el = std::chrono::duration<double>(now - t_start).count();
         if (cfg.benchmark && el >= cfg.bench_secs) {
-            double rate = total_keys / el;
-            std::lock_guard<std::mutex> lk(out_mtx);
-            printf("\n%sbenchmark: %s (%llu keys in %.1f s)\n", tag,
-                   format_rate(rate).c_str(), (unsigned long long)total_keys, el);
-            printf("%sexpected time per match at this rate:\n", tag);
-            for (int len = 5; len <= 9; len++) {
-                double secs = pow(32.0, (double)len) / rate;
-                if (secs < 120.0)
-                    printf("%s  %d chars: %.1f s\n", tag, len, secs);
-                else if (secs < 7200.0)
-                    printf("%s  %d chars: %.1f min\n", tag, len, secs / 60.0);
-                else if (secs < 172800.0)
-                    printf("%s  %d chars: %.1f hours\n", tag, len, secs / 3600.0);
-                else
-                    printf("%s  %d chars: %.1f days\n", tag, len, secs / 86400.0);
+            if (bench_out) {
+                bench_out->keys = total_keys;
+                bench_out->elapsed = el;
             }
             break;
         }
@@ -1218,6 +1215,7 @@ int main(int argc, char** argv)
 
     std::atomic<int> global_found{0};
     std::mutex out_mtx;
+    std::vector<BenchResult> bench_results(devices.size());
 
     if (cfg.multi) {
         printf("using %zu GPUs (device indices:", devices.size());
@@ -1227,13 +1225,42 @@ int main(int argc, char** argv)
 
         std::vector<std::thread> workers;
         workers.reserve(devices.size());
-        for (int d : devices)
-            workers.emplace_back(run_device, d, std::cref(cfg), std::ref(global_found),
-                                 std::ref(out_mtx));
+        for (size_t i = 0; i < devices.size(); i++)
+            workers.emplace_back(run_device, devices[i], std::cref(cfg), std::ref(global_found),
+                                 std::ref(out_mtx), &bench_results[i]);
         for (auto& w : workers)
             w.join();
     } else {
-        run_device(devices[0], cfg, global_found, out_mtx);
+        run_device(devices[0], cfg, global_found, out_mtx, &bench_results[0]);
+    }
+
+    /* combined benchmark summary across all GPUs: throughput adds, so the
+       combined rate is the sum of each device's own keys/sec (not total
+       keys / total elapsed, since devices don't finish at the exact same
+       instant) */
+    if (benchmark) {
+        double total_rate = 0.0;
+        uint64_t total_keys = 0;
+        for (const auto& r : bench_results) {
+            if (r.elapsed > 0.0)
+                total_rate += (double)r.keys / r.elapsed;
+            total_keys += r.keys;
+        }
+        printf("\nbenchmark: %s combined across %zu GPU%s (%llu keys total)\n",
+               format_rate(total_rate).c_str(), devices.size(), devices.size() == 1 ? "" : "s",
+               (unsigned long long)total_keys);
+        printf("expected time per match at this rate:\n");
+        for (int len = 5; len <= 9; len++) {
+            double secs = pow(32.0, (double)len) / total_rate;
+            if (secs < 120.0)
+                printf("  %d chars: %.1f s\n", len, secs);
+            else if (secs < 7200.0)
+                printf("  %d chars: %.1f min\n", len, secs / 60.0);
+            else if (secs < 172800.0)
+                printf("  %d chars: %.1f hours\n", len, secs / 3600.0);
+            else
+                printf("  %d chars: %.1f days\n", len, secs / 86400.0);
+        }
     }
 
     return 0;
