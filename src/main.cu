@@ -1079,8 +1079,8 @@ static void usage(const char* argv0)
             "       %s -b [options]\n"
             "  <prefix>       base32 prefix to search for (chars a-z 2-7)\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
-            "  -d <spec>      CUDA device(s): single index (default 0), comma list\n"
-            "                 e.g. \"0,1,2\", or \"all\" for every visible GPU.\n"
+            "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
+            "                 a single index, or a comma list e.g. \"0,1,2\".\n"
             "                 Each GPU runs fully independently in its own host\n"
             "                 thread (own random start point, own output).\n"
             "  -n <count>     stop after this many matches, summed across all\n"
@@ -1100,7 +1100,7 @@ static void usage(const char* argv0)
 int main(int argc, char** argv)
 {
     const char* prefix = nullptr;
-    std::string device_arg = "0"; /* single index, comma list ("0,1"), or "all" */
+    std::string device_arg = "all"; /* single index, comma list ("0,1"), or "all" (default) */
     int tpb = 0, blocks = 0, batch = 512;
     uint32_t iters = 1024;
     int want = 1;

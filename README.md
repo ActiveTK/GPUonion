@@ -50,7 +50,8 @@ cmake --build build --config Release
 ./gpuonion -b [options]
   <prefix>       探索する base32 プレフィックス (a-z 2-7)
   -b, --bench    約20秒のベンチマークを実行（prefix不要）
-  -d <index>     CUDA デバイス番号 (default 0)
+  -d <spec>      CUDA デバイス指定: "all"（デフォルト、全GPU使用）/ 単一番号 / "0,1,2" のようなカンマ区切り
+                 指定したGPUはそれぞれ独立したホストスレッドで並行して動作する
   -n <count>     この個数見つけたら終了 (default 1)
   -o <dir>       出力ディレクトリ (default ./found)
   --blocks <n>   ブロック数 (default: SM数 * 16)
