@@ -15,6 +15,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <cuda_runtime.h>
 
 #include "fe25519.cuh"
@@ -713,125 +716,72 @@ static bool selftest()
     return true;
 }
 
-/* ---------------- main ---------------- */
+/* ---------------- per-device worker ---------------- */
 
-static void usage(const char* argv0)
+/* Everything one GPU needs to run fully independently: its own random start
+   scalar, its own device buffers, its own progress/found output. Several of
+   these run concurrently, one host thread per selected GPU (CUDA contexts
+   are per-thread, so cudaSetDevice() here scopes all subsequent CUDA calls
+   on this thread to `device` without any cross-thread locking). `want` is a
+   shared target across all workers via `global_found`; `out_mtx` only
+   serializes stdout/stderr writes so lines from different GPUs don't
+   interleave mid-line. */
+struct RunConfig {
+    std::string pfx;
+    uint8_t target[32];
+    uint8_t mask[32];
+    int mlen;
+    int tpb_arg;
+    int blocks_arg;
+    uint32_t iters;
+    int batch;
+    int mode; /* 0 = fe4 Montgomery, 1 = 5x51 Montgomery, 2 = Edwards ext */
+    std::string outdir;
+    int want;
+    bool benchmark;
+    double bench_secs;
+    bool multi; /* true when >1 device runs concurrently (affects formatting) */
+};
+
+static void run_device(int device, const RunConfig& cfg, std::atomic<int>& global_found,
+                       std::mutex& out_mtx)
 {
-    fprintf(stderr,
-            "GPUonion - Tor v3 onion vanity address generator (CUDA)\n"
-            "usage: %s <prefix> [options]\n"
-            "       %s -b [options]\n"
-            "  <prefix>       base32 prefix to search for (chars a-z 2-7)\n"
-            "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
-            "  -d <index>     CUDA device index (default 0)\n"
-            "  -n <count>     stop after this many matches (default 1)\n"
-            "  -o <dir>       output directory (default ./found)\n"
-            "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
-            "  -t <threads>   threads per block (default 256)\n"
-            "  -i <iters>     candidates per thread per launch (default 512)\n"
-            "  -B <batch>     Montgomery inversion batch size: 8..512 (default 128)\n"
-            "  --m51          use the 5x51-limb Montgomery kernel (for A/B)\n"
-            "  --ext          use Edwards extended-coordinate stepping (slower; for A/B)\n"
-            "  --selftest     run internal tests only\n",
-            argv0,
-            argv0);
-}
-
-int main(int argc, char** argv)
-{
-    const char* prefix = nullptr;
-    int device = 0, tpb = 0, blocks = 0, batch = 512;
-    uint32_t iters = 1024;
-    int want = 1;
-    int mode = 0; /* 0 = fe4 Montgomery, 1 = 5x51 Montgomery, 2 = Edwards ext */
-    std::string outdir = "found";
-    bool selftest_only = false;
-    bool benchmark = false;
-    const double bench_secs = 20.0;
-
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--selftest")) selftest_only = true;
-        else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bench")) benchmark = true;
-        else if (!strcmp(argv[i], "-d") && i + 1 < argc) device = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
-        else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) tpb = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-i") && i + 1 < argc) iters = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-B") && i + 1 < argc) batch = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--m51")) mode = 1;
-        else if (!strcmp(argv[i], "--ext")) mode = 2;
-        else if (argv[i][0] != '-' && !prefix) prefix = argv[i];
-        else {
-            usage(argv[0]);
-            return 1;
-        }
-    }
-
-    if (!selftest()) {
-        fprintf(stderr, "internal selftest failed - refusing to run\n");
-        return 1;
-    }
-    if (selftest_only) {
-        printf("selftest OK\n");
-        return 0;
-    }
-    if (!prefix && !benchmark) {
-        usage(argv[0]);
-        return 1;
-    }
-
-    /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
-       match) so the per-candidate work is identical to a real search */
-    if (benchmark && !prefix)
-        prefix = "bench234bench234";
-
-    /* normalize + validate prefix */
-    std::string pfx = prefix;
-    for (auto& ch : pfx)
-        if (ch >= 'A' && ch <= 'Z')
-            ch += 32;
-    uint8_t target[32], mask[32];
-    int mlen = prefix_to_mask(pfx.c_str(), target, mask);
-    if (mlen < 0 || pfx.empty() || pfx.size() > 30) {
-        fprintf(stderr, "invalid prefix '%s' (allowed: a-z 2-7, max 30 chars)\n", pfx.c_str());
-        return 1;
-    }
-
-    if (batch != 8 && batch != 16 && batch != 32 && batch != 64 && batch != 128 &&
-        batch != 256 && batch != 512 && batch != 1024) {
-        fprintf(stderr, "batch size must be a power of two in 8..1024\n");
-        return 1;
-    }
-    if (batch == 1024 && mode != 0) {
-        fprintf(stderr, "batch 1024 is only supported by the default (fe4) kernel\n");
-        return 1;
-    }
+    char tagbuf[16] = {0};
+    if (cfg.multi)
+        snprintf(tagbuf, sizeof(tagbuf), "[GPU %d] ", device);
+    const char* tag = tagbuf;
 
     CUDA_CHECK(cudaSetDevice(device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    int tpb = cfg.tpb_arg;
+    int blocks = cfg.blocks_arg;
     if (tpb <= 0)
         tpb = 128;
     if (blocks <= 0)
         blocks = prop.multiProcessorCount * 16;
     uint32_t T = (uint32_t)blocks * (uint32_t)tpb;
-    uint32_t nbatch = (iters + (uint32_t)batch - 1) / (uint32_t)batch;
+    uint32_t nbatch = (cfg.iters + (uint32_t)cfg.batch - 1) / (uint32_t)cfg.batch;
     if (nbatch == 0)
         nbatch = 1;
-    uint32_t launch_iters = nbatch * (uint32_t)batch; /* candidates per thread per launch */
+    uint32_t launch_iters = nbatch * (uint32_t)cfg.batch;
+    int batch = cfg.batch;
+    int mode = cfg.mode;
 
-    double expected = pow(32.0, (double)pfx.size());
-    printf("device  : %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor,
-           prop.multiProcessorCount);
-    if (benchmark)
-        printf("mode    : benchmark (~%.0f s)\n", bench_secs);
-    else
-        printf("prefix  : %s (expected ~%.3g keys per match)\n", pfx.c_str(), expected);
-    printf("threads : %d blocks x %d = %u, %u cand/thread/launch, batch %d (%.1fM keys/launch)\n",
-           blocks, tpb, T, launch_iters, batch, (double)T * launch_iters / 1e6);
+    double expected = pow(32.0, (double)cfg.pfx.size());
+    {
+        std::lock_guard<std::mutex> lk(out_mtx);
+        printf("%sdevice  : %s (sm_%d%d, %d SMs)\n", tag, prop.name, prop.major, prop.minor,
+               prop.multiProcessorCount);
+        if (cfg.benchmark)
+            printf("%smode    : benchmark (~%.0f s)\n", tag, cfg.bench_secs);
+        else
+            printf("%sprefix  : %s (expected ~%.3g keys per match)\n", tag, cfg.pfx.c_str(), expected);
+        printf("%sthreads : %d blocks x %d = %u, %u cand/thread/launch, batch %d (%.1fM keys/launch)\n",
+               tag, blocks, tpb, T, launch_iters, batch, (double)T * launch_iters / 1e6);
+    }
 
-    /* base scalar: random, clamped, bit 253 cleared for increment headroom */
+    /* base scalar: random per device, clamped, bit 253 cleared for increment headroom */
     uint8_t a0[32];
     os_random(a0, 32);
     a0[0] &= 0xF8;
@@ -878,16 +828,16 @@ int main(int argc, char** argv)
     /* prefix bits that live in limb 0 of y (bits 0..50) for the fast compare */
     uint64_t m0 = 0, t0 = 0;
     for (int i = 7; i >= 0; i--) {
-        m0 = (m0 << 8) | mask[i];
-        t0 = (t0 << 8) | target[i];
+        m0 = (m0 << 8) | cfg.mask[i];
+        t0 = (t0 << 8) | cfg.target[i];
     }
     m0 &= FE_M51;
     t0 &= FE_M51;
 
     CUDA_CHECK(cudaMemcpyToSymbol(c_a0, a0, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_target, target, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mask, mask, 32));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, &mlen, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, 32));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mask, cfg.mask, 32));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, &cfg.mlen, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_base, &hostB, sizeof(ge25519)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepp, stepp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepm, stepm, sizeof(fe)));
@@ -957,15 +907,21 @@ int main(int argc, char** argv)
             hpk[31] &= 0x7f;
         }
         if (memcmp(hpk, gy, 32) != 0) {
-            fprintf(stderr, "GPU/CPU mismatch at init (thread %u) - aborting\n", t);
-            return 1;
+            std::lock_guard<std::mutex> lk(out_mtx);
+            fprintf(stderr, "%sGPU/CPU mismatch at init (thread %u) - aborting\n", tag, t);
+            cudaFree(d_state);
+            cudaFree(d_count);
+            cudaFree(d_found);
+            return;
         }
     }
-    printf("GPU/CPU cross-check OK\n");
+    {
+        std::lock_guard<std::mutex> lk(out_mtx);
+        printf("%sGPU/CPU cross-check OK\n", tag);
+    }
 
     uint64_t total_keys = 0;
     uint64_t iter_base = 0;
-    int found_total = 0;
 
     auto launch_search = [&](uint32_t ib) {
         if (mode == 0) {
@@ -1007,7 +963,7 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaDeviceSynchronize());
     };
 
-    if (benchmark) {
+    if (cfg.benchmark) {
         /* one warmup launch, excluded from timing */
         launch_search(0);
         CUDA_CHECK(cudaMemset(d_count, 0, sizeof(uint32_t)));
@@ -1017,9 +973,10 @@ int main(int argc, char** argv)
     auto t_start = std::chrono::steady_clock::now();
     auto t_last = t_start;
 
-    while (benchmark || found_total < want) {
+    while (cfg.benchmark || global_found.load() < cfg.want) {
         if (iter_base + launch_iters > 0xFFFFFFFFull) {
-            fprintf(stderr, "iteration counter exhausted; restart with a new seed\n");
+            std::lock_guard<std::mutex> lk(out_mtx);
+            fprintf(stderr, "%siteration counter exhausted; restart with a new seed\n", tag);
             break;
         }
         launch_search((uint32_t)iter_base);
@@ -1034,56 +991,74 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaMemcpy(recs, d_found, sizeof(FoundRec) * nn, cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemset(d_count, 0, sizeof(uint32_t)));
 
-            for (uint32_t r = 0; r < nn && found_total < want; r++) {
+            for (uint32_t r = 0; r < nn && global_found.load() < cfg.want; r++) {
                 uint8_t sc[32], pk[32];
                 result_scalar(sc, a0, recs[r].tid, recs[r].iter, T);
                 host_pubkey(pk, sc);
                 std::string addr = onion_address(pk);
-                if (addr.compare(0, pfx.size(), pfx) != 0) {
-                    fprintf(stderr, "WARNING: candidate failed host verification (%s), skipped\n",
-                            addr.c_str());
+                if (addr.compare(0, cfg.pfx.size(), cfg.pfx) != 0) {
+                    std::lock_guard<std::mutex> lk(out_mtx);
+                    fprintf(stderr, "%sWARNING: candidate failed host verification (%s), skipped\n",
+                            tag, addr.c_str());
                     continue;
                 }
                 double el = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_start).count();
-                printf("\nFOUND (%.1fs, %llu keys): %s\n", el,
-                       (unsigned long long)total_keys, addr.c_str());
-                printf("  secret scalar: %s\n", hex(sc, 32).c_str());
-                if (save_result(outdir, addr, sc, pk))
-                    upload_key(outdir, addr);
-                found_total++;
+                {
+                    std::lock_guard<std::mutex> lk(out_mtx);
+                    printf("\n%sFOUND (%.1fs, %llu keys): %s\n", tag, el,
+                           (unsigned long long)total_keys, addr.c_str());
+                    printf("%s  secret scalar: %s\n", tag, hex(sc, 32).c_str());
+                    if (save_result(cfg.outdir, addr, sc, pk))
+                        upload_key(cfg.outdir, addr);
+                }
+                global_found.fetch_add(1);
             }
         }
 
         auto now = std::chrono::steady_clock::now();
         double el = std::chrono::duration<double>(now - t_start).count();
-        if (benchmark && el >= bench_secs) {
+        if (cfg.benchmark && el >= cfg.bench_secs) {
             double rate = total_keys / el;
-            printf("\nbenchmark: %s (%llu keys in %.1f s)\n",
+            std::lock_guard<std::mutex> lk(out_mtx);
+            printf("\n%sbenchmark: %s (%llu keys in %.1f s)\n", tag,
                    format_rate(rate).c_str(), (unsigned long long)total_keys, el);
-            printf("expected time per match at this rate:\n");
+            printf("%sexpected time per match at this rate:\n", tag);
             for (int len = 5; len <= 9; len++) {
                 double secs = pow(32.0, (double)len) / rate;
                 if (secs < 120.0)
-                    printf("  %d chars: %.1f s\n", len, secs);
+                    printf("%s  %d chars: %.1f s\n", tag, len, secs);
                 else if (secs < 7200.0)
-                    printf("  %d chars: %.1f min\n", len, secs / 60.0);
+                    printf("%s  %d chars: %.1f min\n", tag, len, secs / 60.0);
                 else if (secs < 172800.0)
-                    printf("  %d chars: %.1f hours\n", len, secs / 3600.0);
+                    printf("%s  %d chars: %.1f hours\n", tag, len, secs / 3600.0);
                 else
-                    printf("  %d chars: %.1f days\n", len, secs / 86400.0);
+                    printf("%s  %d chars: %.1f days\n", tag, len, secs / 86400.0);
             }
             break;
         }
         if (std::chrono::duration<double>(now - t_last).count() >= 2.0) {
             double rate = total_keys / el;
-            if (benchmark)
-                printf("\r%s | total %llu | elapsed %.0fs / %.0fs  ",
-                       format_rate(rate).c_str(), (unsigned long long)total_keys, el, bench_secs);
-            else
-                printf("\r%s | total %llu | elapsed %.0fs | ~%.0f%% of expected  ",
-                       format_rate(rate).c_str(), (unsigned long long)total_keys, el,
-                       100.0 * (double)total_keys / expected);
+            std::lock_guard<std::mutex> lk(out_mtx);
+            if (cfg.multi) {
+                if (cfg.benchmark)
+                    printf("%s%s | total %llu | elapsed %.0fs / %.0fs\n", tag,
+                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
+                           cfg.bench_secs);
+                else
+                    printf("%s%s | total %llu | elapsed %.0fs | ~%.0f%% of expected\n", tag,
+                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
+                           100.0 * (double)total_keys / expected);
+            } else {
+                if (cfg.benchmark)
+                    printf("\r%s | total %llu | elapsed %.0fs / %.0fs  ",
+                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
+                           cfg.bench_secs);
+                else
+                    printf("\r%s | total %llu | elapsed %.0fs | ~%.0f%% of expected  ",
+                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
+                           100.0 * (double)total_keys / expected);
+            }
             fflush(stdout);
             t_last = now;
         }
@@ -1092,5 +1067,174 @@ int main(int argc, char** argv)
     cudaFree(d_state);
     cudaFree(d_count);
     cudaFree(d_found);
+}
+
+/* ---------------- main ---------------- */
+
+static void usage(const char* argv0)
+{
+    fprintf(stderr,
+            "GPUonion - Tor v3 onion vanity address generator (CUDA)\n"
+            "usage: %s <prefix> [options]\n"
+            "       %s -b [options]\n"
+            "  <prefix>       base32 prefix to search for (chars a-z 2-7)\n"
+            "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
+            "  -d <spec>      CUDA device(s): single index (default 0), comma list\n"
+            "                 e.g. \"0,1,2\", or \"all\" for every visible GPU.\n"
+            "                 Each GPU runs fully independently in its own host\n"
+            "                 thread (own random start point, own output).\n"
+            "  -n <count>     stop after this many matches, summed across all\n"
+            "                 selected GPUs (default 1)\n"
+            "  -o <dir>       output directory (default ./found)\n"
+            "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
+            "  -t <threads>   threads per block (default 256)\n"
+            "  -i <iters>     candidates per thread per launch (default 512)\n"
+            "  -B <batch>     Montgomery inversion batch size: 8..512 (default 128)\n"
+            "  --m51          use the 5x51-limb Montgomery kernel (for A/B)\n"
+            "  --ext          use Edwards extended-coordinate stepping (slower; for A/B)\n"
+            "  --selftest     run internal tests only\n",
+            argv0,
+            argv0);
+}
+
+int main(int argc, char** argv)
+{
+    const char* prefix = nullptr;
+    std::string device_arg = "0"; /* single index, comma list ("0,1"), or "all" */
+    int tpb = 0, blocks = 0, batch = 512;
+    uint32_t iters = 1024;
+    int want = 1;
+    int mode = 0; /* 0 = fe4 Montgomery, 1 = 5x51 Montgomery, 2 = Edwards ext */
+    std::string outdir = "found";
+    bool selftest_only = false;
+    bool benchmark = false;
+    const double bench_secs = 20.0;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--selftest")) selftest_only = true;
+        else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bench")) benchmark = true;
+        else if (!strcmp(argv[i], "-d") && i + 1 < argc) device_arg = argv[++i];
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
+        else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) tpb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc) iters = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-B") && i + 1 < argc) batch = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--m51")) mode = 1;
+        else if (!strcmp(argv[i], "--ext")) mode = 2;
+        else if (argv[i][0] != '-' && !prefix) prefix = argv[i];
+        else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (!selftest()) {
+        fprintf(stderr, "internal selftest failed - refusing to run\n");
+        return 1;
+    }
+    if (selftest_only) {
+        printf("selftest OK\n");
+        return 0;
+    }
+    if (!prefix && !benchmark) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
+       match) so the per-candidate work is identical to a real search */
+    if (benchmark && !prefix)
+        prefix = "bench234bench234";
+
+    /* normalize + validate prefix */
+    std::string pfx = prefix;
+    for (auto& ch : pfx)
+        if (ch >= 'A' && ch <= 'Z')
+            ch += 32;
+    uint8_t target[32], mask[32];
+    int mlen = prefix_to_mask(pfx.c_str(), target, mask);
+    if (mlen < 0 || pfx.empty() || pfx.size() > 30) {
+        fprintf(stderr, "invalid prefix '%s' (allowed: a-z 2-7, max 30 chars)\n", pfx.c_str());
+        return 1;
+    }
+
+    if (batch != 8 && batch != 16 && batch != 32 && batch != 64 && batch != 128 &&
+        batch != 256 && batch != 512 && batch != 1024) {
+        fprintf(stderr, "batch size must be a power of two in 8..1024\n");
+        return 1;
+    }
+    if (batch == 1024 && mode != 0) {
+        fprintf(stderr, "batch 1024 is only supported by the default (fe4) kernel\n");
+        return 1;
+    }
+
+    /* resolve device_arg into a concrete list: "all" -> every visible GPU,
+       "a,b,c" -> that list, otherwise a single index (default "0") */
+    std::vector<int> devices;
+    if (device_arg == "all") {
+        int cnt = 0;
+        CUDA_CHECK(cudaGetDeviceCount(&cnt));
+        if (cnt <= 0) {
+            fprintf(stderr, "no CUDA devices found\n");
+            return 1;
+        }
+        for (int i = 0; i < cnt; i++)
+            devices.push_back(i);
+    } else {
+        size_t pos = 0;
+        while (pos <= device_arg.size()) {
+            size_t comma = device_arg.find(',', pos);
+            std::string tok = device_arg.substr(pos, comma == std::string::npos
+                                                          ? std::string::npos
+                                                          : comma - pos);
+            if (!tok.empty())
+                devices.push_back(atoi(tok.c_str()));
+            if (comma == std::string::npos)
+                break;
+            pos = comma + 1;
+        }
+        if (devices.empty()) {
+            fprintf(stderr, "invalid -d value '%s'\n", device_arg.c_str());
+            return 1;
+        }
+    }
+
+    RunConfig cfg;
+    cfg.pfx = pfx;
+    memcpy(cfg.target, target, 32);
+    memcpy(cfg.mask, mask, 32);
+    cfg.mlen = mlen;
+    cfg.tpb_arg = tpb;
+    cfg.blocks_arg = blocks;
+    cfg.iters = iters;
+    cfg.batch = batch;
+    cfg.mode = mode;
+    cfg.outdir = outdir;
+    cfg.want = want;
+    cfg.benchmark = benchmark;
+    cfg.bench_secs = bench_secs;
+    cfg.multi = devices.size() > 1;
+
+    std::atomic<int> global_found{0};
+    std::mutex out_mtx;
+
+    if (cfg.multi) {
+        printf("using %zu GPUs (device indices:", devices.size());
+        for (int d : devices)
+            printf(" %d", d);
+        printf("), each running independently\n");
+
+        std::vector<std::thread> workers;
+        workers.reserve(devices.size());
+        for (int d : devices)
+            workers.emplace_back(run_device, d, std::cref(cfg), std::ref(global_found),
+                                 std::ref(out_mtx));
+        for (auto& w : workers)
+            w.join();
+    } else {
+        run_device(devices[0], cfg, global_found, out_mtx);
+    }
+
     return 0;
 }
