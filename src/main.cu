@@ -42,15 +42,21 @@
     } while (0)
 
 #define MAX_RESULTS 16
-#define MAX_PREFIXES 256
+#define MAX_PREFIXES 2048
 
 /* ---------------- device constants ---------------- */
 __constant__ uint8_t c_a0[32];
 /* up to MAX_PREFIXES independent target/mask patterns; a candidate matches
-   the search as soon as it satisfies any one of them */
+   the search as soon as it satisfies any one of them.
+   c_target/c_mask hold the full 32-byte patterns needed only by the rare
+   byte-level confirm (prefix_full_match) once the hot-path bucket check
+   below already thinks it has a match, so they live in plain __device__
+   global memory rather than __constant__: at MAX_PREFIXES=2048 the two
+   arrays alone would be 128KB, well past the 64KB constant memory budget
+   that the small, every-candidate bucket-lookup tables below still need. */
 __constant__ int c_nprefixes;
-__constant__ uint8_t c_target[MAX_PREFIXES][32];
-__constant__ uint8_t c_mask[MAX_PREFIXES][32];
+__device__ uint8_t c_target[MAX_PREFIXES][32];
+__device__ uint8_t c_mask[MAX_PREFIXES][32];
 __constant__ int c_mlen[MAX_PREFIXES];
 __constant__ ge25519 c_base; /* B */
 /* step point S = (8*T)*B in cached affine form for mixed addition */
@@ -1400,8 +1406,10 @@ int main(int argc, char** argv)
         } else {
             printf("prefixes: %zu patterns, any match wins (expected ~%.3g keys per match)\n",
                    cfg.prefixes.size(), expected);
-            for (const auto& s : cfg.prefixes)
-                printf("            %s\n", s.c_str());
+            if (cfg.prefixes.size() < 20) {
+                for (const auto& s : cfg.prefixes)
+                    printf("            %s\n", s.c_str());
+            }
         }
 
         uint32_t nb = (iters + (uint32_t)batch - 1) / (uint32_t)batch;
