@@ -740,8 +740,21 @@ struct RunConfig {
     int want;
     bool benchmark;
     double bench_secs;
-    bool multi; /* true when >1 device runs concurrently (affects formatting) */
 };
+
+/* threads-per-block / blocks-per-grid a device will actually launch with,
+   given the user's -t/--blocks overrides (0 = unset -> default). Shared by
+   the startup banner (main) and the worker (run_device) so they never
+   disagree about how many threads a GPU is running. */
+static void resolve_launch(const RunConfig& cfg, const cudaDeviceProp& prop, int& tpb, int& blocks)
+{
+    tpb = cfg.tpb_arg;
+    blocks = cfg.blocks_arg;
+    if (tpb <= 0)
+        tpb = 128;
+    if (blocks <= 0)
+        blocks = prop.multiProcessorCount * 16;
+}
 
 /* benchmark outcome for one GPU, filled in just before the worker returns;
    the caller aggregates these across all devices once every thread has
@@ -753,22 +766,15 @@ struct BenchResult {
 };
 
 static void run_device(int device, const RunConfig& cfg, std::atomic<int>& global_found,
-                       std::mutex& out_mtx, BenchResult* bench_out)
+                       std::atomic<uint64_t>& g_total_keys, std::atomic<int>& g_crosscheck_ok,
+                       std::chrono::steady_clock::time_point t_start, std::mutex& out_mtx,
+                       BenchResult* bench_out)
 {
-    char tagbuf[16] = {0};
-    if (cfg.multi)
-        snprintf(tagbuf, sizeof(tagbuf), "[GPU %d] ", device);
-    const char* tag = tagbuf;
-
     CUDA_CHECK(cudaSetDevice(device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-    int tpb = cfg.tpb_arg;
-    int blocks = cfg.blocks_arg;
-    if (tpb <= 0)
-        tpb = 128;
-    if (blocks <= 0)
-        blocks = prop.multiProcessorCount * 16;
+    int tpb, blocks;
+    resolve_launch(cfg, prop, tpb, blocks);
     uint32_t T = (uint32_t)blocks * (uint32_t)tpb;
     uint32_t nbatch = (cfg.iters + (uint32_t)cfg.batch - 1) / (uint32_t)cfg.batch;
     if (nbatch == 0)
@@ -776,19 +782,6 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     uint32_t launch_iters = nbatch * (uint32_t)cfg.batch;
     int batch = cfg.batch;
     int mode = cfg.mode;
-
-    double expected = pow(32.0, (double)cfg.pfx.size());
-    {
-        std::lock_guard<std::mutex> lk(out_mtx);
-        printf("%sdevice  : %s (sm_%d%d, %d SMs)\n", tag, prop.name, prop.major, prop.minor,
-               prop.multiProcessorCount);
-        if (cfg.benchmark)
-            printf("%smode    : benchmark (~%.0f s)\n", tag, cfg.bench_secs);
-        else
-            printf("%sprefix  : %s (expected ~%.3g keys per match)\n", tag, cfg.pfx.c_str(), expected);
-        printf("%sthreads : %d blocks x %d = %u, %u cand/thread/launch, batch %d (%.1fM keys/launch)\n",
-               tag, blocks, tpb, T, launch_iters, batch, (double)T * launch_iters / 1e6);
-    }
 
     /* base scalar: random per device, clamped, bit 253 cleared for increment headroom */
     uint8_t a0[32];
@@ -917,17 +910,14 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         }
         if (memcmp(hpk, gy, 32) != 0) {
             std::lock_guard<std::mutex> lk(out_mtx);
-            fprintf(stderr, "%sGPU/CPU mismatch at init (thread %u) - aborting\n", tag, t);
+            fprintf(stderr, "device %d: GPU/CPU mismatch at init - aborting\n", device);
             cudaFree(d_state);
             cudaFree(d_count);
             cudaFree(d_found);
             return;
         }
     }
-    {
-        std::lock_guard<std::mutex> lk(out_mtx);
-        printf("%sGPU/CPU cross-check OK\n", tag);
-    }
+    g_crosscheck_ok.fetch_add(1, std::memory_order_relaxed);
 
     uint64_t total_keys = 0;
     uint64_t iter_base = 0;
@@ -979,18 +969,17 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         iter_base = launch_iters;
     }
 
-    auto t_start = std::chrono::steady_clock::now();
-    auto t_last = t_start;
-
     while (cfg.benchmark || global_found.load() < cfg.want) {
         if (iter_base + launch_iters > 0xFFFFFFFFull) {
             std::lock_guard<std::mutex> lk(out_mtx);
-            fprintf(stderr, "%siteration counter exhausted; restart with a new seed\n", tag);
+            fprintf(stderr, "device %d: iteration counter exhausted; restart with a new seed\n",
+                    device);
             break;
         }
         launch_search((uint32_t)iter_base);
         iter_base += launch_iters;
         total_keys += (uint64_t)T * launch_iters;
+        g_total_keys.fetch_add((uint64_t)T * launch_iters, std::memory_order_relaxed);
 
         uint32_t n = 0;
         CUDA_CHECK(cudaMemcpy(&n, d_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1007,17 +996,17 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                 std::string addr = onion_address(pk);
                 if (addr.compare(0, cfg.pfx.size(), cfg.pfx) != 0) {
                     std::lock_guard<std::mutex> lk(out_mtx);
-                    fprintf(stderr, "%sWARNING: candidate failed host verification (%s), skipped\n",
-                            tag, addr.c_str());
+                    fprintf(stderr, "WARNING: candidate failed host verification (%s), skipped\n",
+                            addr.c_str());
                     continue;
                 }
                 double el = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_start).count();
                 {
                     std::lock_guard<std::mutex> lk(out_mtx);
-                    printf("\n%sFOUND (%.1fs, %llu keys): %s\n", tag, el,
-                           (unsigned long long)total_keys, addr.c_str());
-                    printf("%s  secret scalar: %s\n", tag, hex(sc, 32).c_str());
+                    printf("\nFOUND (%.1fs, %llu keys total): %s\n", el,
+                           (unsigned long long)g_total_keys.load(), addr.c_str());
+                    printf("  secret scalar: %s\n", hex(sc, 32).c_str());
                     if (save_result(cfg.outdir, addr, sc, pk))
                         upload_key(cfg.outdir, addr);
                 }
@@ -1025,39 +1014,14 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
             }
         }
 
-        auto now = std::chrono::steady_clock::now();
-        double el = std::chrono::duration<double>(now - t_start).count();
+        double el = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - t_start).count();
         if (cfg.benchmark && el >= cfg.bench_secs) {
             if (bench_out) {
                 bench_out->keys = total_keys;
                 bench_out->elapsed = el;
             }
             break;
-        }
-        if (std::chrono::duration<double>(now - t_last).count() >= 2.0) {
-            double rate = total_keys / el;
-            std::lock_guard<std::mutex> lk(out_mtx);
-            if (cfg.multi) {
-                if (cfg.benchmark)
-                    printf("%s%s | total %llu | elapsed %.0fs / %.0fs\n", tag,
-                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
-                           cfg.bench_secs);
-                else
-                    printf("%s%s | total %llu | elapsed %.0fs | ~%.0f%% of expected\n", tag,
-                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
-                           100.0 * (double)total_keys / expected);
-            } else {
-                if (cfg.benchmark)
-                    printf("\r%s | total %llu | elapsed %.0fs / %.0fs  ",
-                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
-                           cfg.bench_secs);
-                else
-                    printf("\r%s | total %llu | elapsed %.0fs | ~%.0f%% of expected  ",
-                           format_rate(rate).c_str(), (unsigned long long)total_keys, el,
-                           100.0 * (double)total_keys / expected);
-            }
-            fflush(stdout);
-            t_last = now;
         }
     }
 
@@ -1211,28 +1175,107 @@ int main(int argc, char** argv)
     cfg.want = want;
     cfg.benchmark = benchmark;
     cfg.bench_secs = bench_secs;
-    cfg.multi = devices.size() > 1;
+
+    double expected = pow(32.0, (double)pfx.size());
+
+    /* combined startup banner: group devices with identical name/SM count so
+       a large fleet prints one line, not one block of text per GPU */
+    {
+        struct DevGroup { std::string name; int major, minor, sms, count; };
+        std::vector<DevGroup> groups;
+        uint64_t T_total = 0;
+        for (int d : devices) {
+            cudaDeviceProp prop;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop, d));
+            int tpb_r, blocks_r;
+            resolve_launch(cfg, prop, tpb_r, blocks_r);
+            T_total += (uint64_t)tpb_r * (uint64_t)blocks_r;
+            bool merged = false;
+            for (auto& g : groups) {
+                if (g.name == prop.name && g.major == prop.major && g.minor == prop.minor &&
+                    g.sms == prop.multiProcessorCount) {
+                    g.count++;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged)
+                groups.push_back({prop.name, prop.major, prop.minor, prop.multiProcessorCount, 1});
+        }
+
+        printf("devices : %zu GPU%s - ", devices.size(), devices.size() == 1 ? "" : "s");
+        for (size_t i = 0; i < groups.size(); i++) {
+            const auto& g = groups[i];
+            printf("%s%dx %s (sm_%d%d, %d SMs)", i ? ", " : "", g.count, g.name.c_str(), g.major,
+                   g.minor, g.sms);
+        }
+        printf("\n");
+
+        if (benchmark)
+            printf("mode    : benchmark (~%.0f s)\n", bench_secs);
+        else
+            printf("prefix  : %s (expected ~%.3g keys per match)\n", pfx.c_str(), expected);
+
+        uint32_t nb = (iters + (uint32_t)batch - 1) / (uint32_t)batch;
+        if (nb == 0)
+            nb = 1;
+        uint32_t launch_iters = nb * (uint32_t)batch;
+        printf("threads : %llu total, %u cand/thread/launch, batch %d (%.1fM keys/launch combined)\n",
+               (unsigned long long)T_total, launch_iters, batch,
+               (double)T_total * launch_iters / 1e6);
+    }
 
     std::atomic<int> global_found{0};
+    std::atomic<int> g_crosscheck_ok{0};
+    std::atomic<uint64_t> g_total_keys{0};
+    std::atomic<bool> g_stop{false};
     std::mutex out_mtx;
     std::vector<BenchResult> bench_results(devices.size());
+    auto t_start = std::chrono::steady_clock::now();
 
-    if (cfg.multi) {
-        printf("using %zu GPUs (device indices:", devices.size());
-        for (int d : devices)
-            printf(" %d", d);
-        printf("), each running independently\n");
+    /* single reporter thread prints one combined progress line for every GPU
+       together, instead of each device's worker printing its own */
+    std::thread reporter([&]() {
+        auto t_last = t_start;
+        while (!g_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - t_last).count() < 2.0)
+                continue;
+            double el = std::chrono::duration<double>(now - t_start).count();
+            uint64_t total = g_total_keys.load();
+            double rate = el > 0.0 ? (double)total / el : 0.0;
+            std::lock_guard<std::mutex> lk(out_mtx);
+            if (benchmark)
+                printf("\r%s | total %llu | elapsed %.0fs / %.0fs  ",
+                       format_rate(rate).c_str(), (unsigned long long)total, el, bench_secs);
+            else
+                printf("\r%s | total %llu | elapsed %.0fs | ~%.0f%% of expected  ",
+                       format_rate(rate).c_str(), (unsigned long long)total, el,
+                       100.0 * (double)total / expected);
+            fflush(stdout);
+            t_last = now;
+        }
+    });
 
-        std::vector<std::thread> workers;
-        workers.reserve(devices.size());
-        for (size_t i = 0; i < devices.size(); i++)
-            workers.emplace_back(run_device, devices[i], std::cref(cfg), std::ref(global_found),
-                                 std::ref(out_mtx), &bench_results[i]);
-        for (auto& w : workers)
-            w.join();
-    } else {
-        run_device(devices[0], cfg, global_found, out_mtx, &bench_results[0]);
-    }
+    std::vector<std::thread> workers;
+    workers.reserve(devices.size());
+    for (size_t i = 0; i < devices.size(); i++)
+        workers.emplace_back(run_device, devices[i], std::cref(cfg), std::ref(global_found),
+                             std::ref(g_total_keys), std::ref(g_crosscheck_ok), t_start,
+                             std::ref(out_mtx), &bench_results[i]);
+    for (auto& w : workers)
+        w.join();
+
+    g_stop.store(true);
+    reporter.join();
+
+    int ok = g_crosscheck_ok.load();
+    if ((size_t)ok < devices.size())
+        fprintf(stderr, "WARNING: GPU/CPU cross-check failed on %zu of %zu GPU(s); see errors above\n",
+                devices.size() - (size_t)ok, devices.size());
+    else
+        printf("\nGPU/CPU cross-check OK (%d/%zu GPUs)\n", ok, devices.size());
 
     /* combined benchmark summary across all GPUs: throughput adds, so the
        combined rate is the sum of each device's own keys/sec (not total
