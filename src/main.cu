@@ -61,6 +61,14 @@ __constant__ fe c_step2dt; /* 2d*Sx*Sy */
    per prefix pattern */
 __constant__ uint64_t c_t0[MAX_PREFIXES];
 __constant__ uint64_t c_m0[MAX_PREFIXES];
+/* Radix bucketing on each pattern's first base32 character (bits 3..7 of
+   y's lowest byte -> 32 possible values) so a candidate only has to scan the
+   handful of prefixes that could possibly start the same way, instead of all
+   c_nprefixes of them every single candidate. c_bucket_start[32] holds
+   prefix-sum offsets into c_bucket_idx (33 entries: 32 buckets + end
+   sentinel); c_bucket_idx holds prefix indices grouped by bucket. */
+__constant__ int c_bucket_start[33];
+__constant__ int c_bucket_idx[MAX_PREFIXES];
 /* Montgomery x-only stepping: u(S)+1, u(S)-1, and -S (Edwards ext.) for init */
 __constant__ fe c_msp;
 __constant__ fe c_msm;
@@ -86,6 +94,22 @@ __device__ __forceinline__ bool prefix_full_match(const uint8_t pk[32], int p)
             return false;
     }
     return true;
+}
+
+/* Quick reject for the non-lazy kernels (k_search, k_search_mont): y0 is
+   already the canonical low limb, so its first base32 character (bits 3..7)
+   picks exactly one bucket - no offset ambiguity, unlike the fe4 lazy case
+   below. Scans only that bucket instead of every configured prefix. */
+__device__ __forceinline__ bool bucket_quick_any(uint64_t y0)
+{
+    int bk = (int)((y0 >> 3) & 0x1F);
+    int end = c_bucket_start[bk + 1];
+    for (int i = c_bucket_start[bk]; i < end; i++) {
+        int p = c_bucket_idx[i];
+        if (((y0 ^ c_t0[p]) & c_m0[p]) == 0)
+            return true;
+    }
+    return false;
 }
 
 /* thread state for Montgomery x-only stepping: projective u of P_k and P_{k-1}
@@ -249,17 +273,13 @@ __global__ void k_search(ge25519* pts, uint32_t nthreads, uint32_t nbatch,
             }
             fe_mul(y, Ys[k], zi);
             uint64_t y0 = y[0];
-            bool any_quick = false;
-            for (int p = 0; p < c_nprefixes; p++) {
-                if (((y0 ^ c_t0[p]) & c_m0[p]) == 0) {
-                    any_quick = true;
-                    break;
-                }
-            }
-            if (any_quick) {
+            if (bucket_quick_any(y0)) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
-                for (int p = 0; p < c_nprefixes; p++) {
+                int bk = (int)((y0 >> 3) & 0x1F);
+                int end = c_bucket_start[bk + 1];
+                for (int i = c_bucket_start[bk]; i < end; i++) {
+                    int p = c_bucket_idx[i];
                     if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
@@ -330,17 +350,13 @@ __global__ void k_search_mont(MontState* st, uint32_t nthreads, uint32_t nbatch,
             }
             fe_mul(y, Ns[k], zi);
             uint64_t y0 = y[0];
-            bool any_quick = false;
-            for (int p = 0; p < c_nprefixes; p++) {
-                if (((y0 ^ c_t0[p]) & c_m0[p]) == 0) {
-                    any_quick = true;
-                    break;
-                }
-            }
-            if (any_quick) {
+            if (bucket_quick_any(y0)) {
                 uint8_t pk[32];
                 fe_tobytes(pk, y);
-                for (int p = 0; p < c_nprefixes; p++) {
+                int bk = (int)((y0 >> 3) & 0x1F);
+                int end = c_bucket_start[bk + 1];
+                for (int i = c_bucket_start[bk]; i < end; i++) {
+                    int p = c_bucket_idx[i];
                     if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
@@ -413,26 +429,36 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
             if (k > 0)
                 fe4_mul(inv, inv, Ds[k]);
             /* y is lazy: value is y_true + j*p for j in {0,1,2}, and limb 0 of
-               y_true is then y[0] + 19j (mod 2^64). Cheap triple compare keeps
-               canonicalization off the hot path; checked against every
-               prefix pattern before paying for fe4_canon. */
+               y_true is then y[0] + 19j (mod 2^64). The offset also shifts
+               which bucket (first base32 char) the true value falls into, so
+               each of the 3 candidate values gets its own bucket lookup -
+               still only a handful of prefix checks total, not c_nprefixes
+               times 3, and canonicalization stays off the hot path. */
             uint64_t y0 = y[0];
+            uint64_t yv[3] = { y0, y0 + 19, y0 + 38 };
             bool maybe = false;
-            for (int p = 0; p < c_nprefixes; p++) {
-                uint64_t t0 = c_t0[p], m0 = c_m0[p];
-                if ((((y0 ^ t0) & m0) == 0) || ((((y0 + 19) ^ t0) & m0) == 0) ||
-                    ((((y0 + 38) ^ t0) & m0) == 0)) {
-                    maybe = true;
-                    break;
+#pragma unroll
+            for (int j = 0; j < 3 && !maybe; j++) {
+                int bk = (int)((yv[j] >> 3) & 0x1F);
+                int end = c_bucket_start[bk + 1];
+                for (int i = c_bucket_start[bk]; i < end; i++) {
+                    int p = c_bucket_idx[i];
+                    if (((yv[j] ^ c_t0[p]) & c_m0[p]) == 0) {
+                        maybe = true;
+                        break;
+                    }
                 }
             }
             if (maybe) {
                 fe4_canon(y);
-                y0 = y[0];
+                uint64_t yc = y[0];
                 uint8_t pk[32];
                 fe4_tobytes(pk, y);
-                for (int p = 0; p < c_nprefixes; p++) {
-                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                int bk = (int)((yc >> 3) & 0x1F);
+                int end = c_bucket_start[bk + 1];
+                for (int i = c_bucket_start[bk]; i < end; i++) {
+                    int p = c_bucket_idx[i];
+                    if (((yc ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
                             found[idx].tid = t;
@@ -906,6 +932,22 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         t0[p] = tt & FE_M51;
     }
 
+    /* group prefix indices by their first base32 character (top 5 bits of
+       target byte 0, always fully masked since every prefix is >= 1 char) so
+       the search kernels only scan a bucket instead of every prefix */
+    int bucket_start[33] = {0};
+    int bucket_idx[MAX_PREFIXES];
+    for (int p = 0; p < cfg.nprefixes; p++)
+        bucket_start[((cfg.target[p][0] >> 3) & 0x1F) + 1]++;
+    for (int b = 0; b < 32; b++)
+        bucket_start[b + 1] += bucket_start[b];
+    {
+        int cursor[32];
+        memcpy(cursor, bucket_start, sizeof(cursor));
+        for (int p = 0; p < cfg.nprefixes; p++)
+            bucket_idx[cursor[(cfg.target[p][0] >> 3) & 0x1F]++] = p;
+    }
+
     CUDA_CHECK(cudaMemcpyToSymbol(c_a0, a0, 32));
     CUDA_CHECK(cudaMemcpyToSymbol(c_nprefixes, &cfg.nprefixes, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
@@ -917,6 +959,9 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     CUDA_CHECK(cudaMemcpyToSymbol(c_step2dt, step2dt, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_t0, t0, sizeof(uint64_t) * cfg.nprefixes));
     CUDA_CHECK(cudaMemcpyToSymbol(c_m0, m0, sizeof(uint64_t) * cfg.nprefixes));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_bucket_start, bucket_start, sizeof(bucket_start)));
+    if (cfg.nprefixes > 0)
+        CUDA_CHECK(cudaMemcpyToSymbol(c_bucket_idx, bucket_idx, sizeof(int) * cfg.nprefixes));
     CUDA_CHECK(cudaMemcpyToSymbol(c_msp, msp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_msm, msm, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepneg, &stepneg, sizeof(ge25519)));
