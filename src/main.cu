@@ -135,9 +135,11 @@ __device__ uint32_t g_bloom[BLOOM_WORDS];
    enforced; a word that appears in both lists needs a partner from either.
 
    Such a pattern firing only clears stage 1: the characters following the
-   word must themselves be a word of length c_target_len - ftlen drawn from an
-   allowed list, which stage 2 looks up in the length bucket
-   [c_wl_start[l], c_wl_end[l]) of the merged word table. Every per-candidate
+   word must themselves be a word of length T - ftlen, for one of the target
+   lengths T in c_target_lens[], drawn from an allowed list, which stage 2
+   looks up in the length bucket [c_wl_start[l], c_wl_end[l]) of the merged
+   word table. Several target lengths cost one extra bucket lookup each, and
+   only at the stage-1 rate, so they are close to free. Every per-candidate
    cost therefore scales with |A|+|B| while the effective pattern count is
    about |A|*|B| - far past MAX_PREFIXES, and with a smaller device pattern
    count (hence a lower prefilter pass rate) than listing the pairs ever
@@ -145,7 +147,9 @@ __device__ uint32_t g_bloom[BLOOM_WORDS];
 #define MAX_WORD_LEN 30
 #define WORD_IN_A 1u
 #define WORD_IN_B 2u
-__constant__ int c_target_len; /* 0 when the mode is off */
+#define MAX_TARGET_LENS 8
+__constant__ int c_ntarget_len; /* 0 when the mode is off */
+__constant__ int c_target_lens[MAX_TARGET_LENS]; /* ascending, distinct */
 /* 0 = plain prefix; else (first-word length) | (allowed partner lists << 5) */
 __constant__ uint8_t c_ftinfo[MAX_PREFIXES];
 __constant__ int c_wl_start[32];
@@ -229,44 +233,47 @@ __device__ __noinline__ bool word_tail_match(const uint8_t pk[32], int p, uint32
         return true;
     int ft = (int)(info & 31u);
     uint32_t need = info >> 5;
-    int tl = c_target_len - ft;
-    if (tl < 1 || tl > MAX_WORD_LEN)
-        return false;
-    int lo = c_wl_start[tl], hi = c_wl_end[tl];
-    if (tl <= WORD_KEY_MAX) {
-        /* pack the tail the same way the host packed the words, then binary
-           search the bucket; keys are unique within a length because the word
-           table is de-duplicated, so at most one word can match */
-        uint64_t key = 0;
-        for (int j = 0; j < tl; j++)
-            key = (key << 5) | (uint64_t)b32_char(pk, ft + j);
-        while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            if (g_wordkey[mid] < key)
-                lo = mid + 1;
-            else
-                hi = mid;
-        }
-        if (lo < c_wl_end[tl] && g_wordkey[lo] == key && (g_wordmemb[lo] & need)) {
-            w2 = (uint32_t)lo;
-            return true;
-        }
-        return false;
-    }
-    /* longer than one packed key can hold: fall back to the byte compare */
-    for (int w = lo; w < hi; w++) {
-        if (!(g_wordmemb[w] & need))
-            continue; /* right length, wrong list - would be an A+A or B+B pair */
-        bool ok = true;
-        for (int j = 0; j < tl; j++) {
-            if (g_wordchars[w][j] != (uint8_t)b32_char(pk, ft + j)) {
-                ok = false;
-                break;
+    /* c_ntarget_len is grid-uniform, so this loop is uniform too */
+    for (int ti = 0; ti < c_ntarget_len; ti++) {
+        int tl = c_target_lens[ti] - ft;
+        if (tl < 1 || tl > MAX_WORD_LEN)
+            continue;
+        int lo = c_wl_start[tl], hi = c_wl_end[tl];
+        if (tl <= WORD_KEY_MAX) {
+            /* pack the tail the same way the host packed the words, then binary
+               search the bucket; keys are unique within a length because the word
+               table is de-duplicated, so at most one word can match */
+            uint64_t key = 0;
+            for (int j = 0; j < tl; j++)
+                key = (key << 5) | (uint64_t)b32_char(pk, ft + j);
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (g_wordkey[mid] < key)
+                    lo = mid + 1;
+                else
+                    hi = mid;
             }
+            if (lo < c_wl_end[tl] && g_wordkey[lo] == key && (g_wordmemb[lo] & need)) {
+                w2 = (uint32_t)lo;
+                return true;
+            }
+            continue;
         }
-        if (ok) {
-            w2 = (uint32_t)w;
-            return true;
+        /* longer than one packed key can hold: fall back to the byte compare */
+        for (int w = lo; w < hi; w++) {
+            if (!(g_wordmemb[w] & need))
+                continue; /* right length, wrong list - would be an A+A or B+B pair */
+            bool ok = true;
+            for (int j = 0; j < tl; j++) {
+                if (g_wordchars[w][j] != (uint8_t)b32_char(pk, ft + j)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                w2 = (uint32_t)w;
+                return true;
+            }
         }
     }
     return false;
@@ -1573,9 +1580,10 @@ struct RunConfig {
     bool split;
     ge25519 split_pt;
     uint8_t split_pk[32];
-    /* --use-wordlist-ab-with-normal-list. target_len == 0 means the mode is
+    /* --use-wordlist-ab-with-normal-list. ntarget_len == 0 means the mode is
        off, in which case ftinfo is all zero and the device skips stage 2. */
-    int target_len;
+    int ntarget_len;
+    int target_lens[MAX_TARGET_LENS]; /* ascending, distinct */
     uint8_t ftinfo[MAX_PREFIXES];    /* 0 = plain prefix, else len | (partner lists << 5) */
     std::vector<std::string> words;  /* merged A+B, ordered by character length */
     std::vector<uint8_t> wordchars;  /* the same, base32 values, MAX_WORD_LEN per word */
@@ -1873,7 +1881,8 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_mask, cfg.mask, sizeof(cfg.mask)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, cfg.mlen, sizeof(cfg.mlen)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_target_len, &cfg.target_len, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_ntarget_len, &cfg.ntarget_len, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_target_lens, cfg.target_lens, sizeof(cfg.target_lens)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_ftinfo, cfg.ftinfo, sizeof(cfg.ftinfo)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_wl_start, cfg.wl_start, sizeof(cfg.wl_start)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_wl_end, cfg.wl_end, sizeof(cfg.wl_end)));
@@ -2118,10 +2127,12 @@ static void usage(const char* argv0)
             "                 lines skipped). Combined with any given on the command\n"
             "                 line. Every line is validated up front; an invalid one\n"
             "                 aborts with its file:line before any GPU work starts.\n"
-            "  --use-wordlist-ab-with-normal-list <list-A> <list-B> <len> <normal-list>\n"
+            "  --use-wordlist-ab-with-normal-list <list-A> <list-B> <len[,len...]> <normal-list>\n"
             "                 build prefixes by concatenating one word from A\n"
             "                 with one word from B, in either order, so the\n"
-            "                 result is exactly <len> chars. A+A and B+B are\n"
+            "                 result is exactly <len> chars; a comma-separated\n"
+            "                 list (e.g. 12,13) searches every listed length at\n"
+            "                 once, at no extra per-key cost. A+A and B+B are\n"
             "                 never paired, so \"200 nouns x 600 adjectives\"\n"
             "                 stays readable. Word lists take one word per line\n"
             "                 and/or comma-separated words. The pairs are never\n"
@@ -2196,9 +2207,10 @@ int main(int argc, char** argv)
 {
     std::vector<std::string> prefix_args; /* raw positional args, may still hold comma lists */
     std::string prefix_file; /* --prefix-from-file: one prefix per line */
-    /* --use-wordlist-ab-with-normal-list <A> <B> <target len> <normal list> */
+    /* --use-wordlist-ab-with-normal-list <A> <B> <target len[,len...]> <normal list> */
     std::string wl_path_a, wl_path_b, wl_normal_path;
-    int wl_target_len = 0;
+    std::string wl_target_arg;
+    std::vector<int> wl_target_lens; /* parsed: ascending, distinct */
     /* Words shorter than this never become a first-half device pattern (they
        stay usable as tails). A short first word is keyed on only its own few
        characters, so it clears the prefilter ~32^-len of the time and drags
@@ -2245,7 +2257,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--use-wordlist-ab-with-normal-list") && i + 4 < argc) {
             wl_path_a = argv[++i];
             wl_path_b = argv[++i];
-            wl_target_len = atoi(argv[++i]);
+            wl_target_arg = argv[++i];
             wl_normal_path = argv[++i];
         }
         else if (!strcmp(argv[i], "--min-first-len") && i + 1 < argc) wl_min_first_len = atoi(argv[++i]);
@@ -2299,7 +2311,7 @@ int main(int argc, char** argv)
 
     /* --use-wordlist-ab-with-normal-list. The normal list is read exactly like
        --prefix-from-file. The pairs are NOT expanded: every word of A and of B
-       that can start a target_len pair becomes one device pattern, carrying
+       that can start a pair of a target length becomes one device pattern, carrying
        the list(s) its partner may come from, and the tail is checked on the
        GPU by word_tail_match. |A|+|B| device patterns therefore stand for
        about |A|*|B|*2 real prefixes. A word with no legal partner of the
@@ -2311,10 +2323,34 @@ int main(int argc, char** argv)
     int wl_cnt[32] = {0};              /* words per character length */
     int wl_cnt_memb[32][4] = {{0}};    /* words per length matching a partner mask */
     if (!wl_path_a.empty()) {
-        if (wl_target_len < 2 || wl_target_len > MAX_WORD_LEN) {
-            fprintf(stderr, "target length must be 2..%d (got %d)\n", MAX_WORD_LEN,
-                    wl_target_len);
-            return 1;
+        /* comma-separated target lengths; duplicates collapse, order is free */
+        {
+            size_t pos = 0;
+            while (pos <= wl_target_arg.size()) {
+                size_t comma = wl_target_arg.find(',', pos);
+                std::string tok = wl_target_arg.substr(
+                    pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                pos = comma == std::string::npos ? wl_target_arg.size() + 1 : comma + 1;
+                if (tok.empty() || tok.find_first_not_of("0123456789") != std::string::npos) {
+                    fprintf(stderr, "bad target length list '%s' (want e.g. 12 or 12,13)\n",
+                            wl_target_arg.c_str());
+                    return 1;
+                }
+                int v = atoi(tok.c_str());
+                if (v < 2 || v > MAX_WORD_LEN) {
+                    fprintf(stderr, "target length must be 2..%d (got %d)\n", MAX_WORD_LEN, v);
+                    return 1;
+                }
+                if (std::find(wl_target_lens.begin(), wl_target_lens.end(), v) ==
+                    wl_target_lens.end())
+                    wl_target_lens.push_back(v);
+            }
+            std::sort(wl_target_lens.begin(), wl_target_lens.end());
+            if (wl_target_lens.size() > (size_t)MAX_TARGET_LENS) {
+                fprintf(stderr, "at most %d distinct target lengths (got %zu)\n",
+                        MAX_TARGET_LENS, wl_target_lens.size());
+                return 1;
+            }
         }
         std::vector<std::string> words_a, words_b, normal_raw;
         if (!load_words_from_file(wl_path_a, words_a))
@@ -2387,9 +2423,14 @@ int main(int argc, char** argv)
             /* a word from A needs a partner from B and vice versa */
             uint32_t need = ((wl_memb[i] & WORD_IN_A) ? WORD_IN_B : 0u) |
                             ((wl_memb[i] & WORD_IN_B) ? WORD_IN_A : 0u);
-            int comp = wl_target_len - (int)wl_words[i].size();
-            if (comp < 1 || comp > MAX_WORD_LEN || wl_cnt_memb[comp][need] == 0)
-                continue; /* no legal partner of the complementary length */
+            bool has_partner = false;
+            for (int T : wl_target_lens) {
+                int comp = T - (int)wl_words[i].size();
+                if (comp >= 1 && comp <= MAX_WORD_LEN && wl_cnt_memb[comp][need] > 0)
+                    has_partner = true;
+            }
+            if (!has_partner)
+                continue; /* no legal partner of a complementary length */
             /* too short to lead: keep it in the tail table (built above from
                every word) but do not give it a device pattern, so the pairs
                where it comes second are still searched and only the ones where
@@ -2404,9 +2445,10 @@ int main(int argc, char** argv)
         }
         if (nfirst == 0) {
             fprintf(stderr,
-                    "no word of '%s' pairs with a word of '%s' to make %d characters"
+                    "no word of '%s' pairs with a word of '%s' to make %s characters"
                     " with --min-first-len %d\n",
-                    wl_path_a.c_str(), wl_path_b.c_str(), wl_target_len, wl_min_first_len);
+                    wl_path_a.c_str(), wl_path_b.c_str(), wl_target_arg.c_str(),
+                    wl_min_first_len);
             return 1;
         }
         if (nshort_skipped > 0)
@@ -2432,7 +2474,9 @@ int main(int argc, char** argv)
     /* normalize + validate each prefix */
     raw_ftinfo.resize(raw_prefixes.size(), 0);
     RunConfig cfg{};
-    cfg.target_len = wl_path_a.empty() ? 0 : wl_target_len;
+    cfg.ntarget_len = wl_path_a.empty() ? 0 : (int)wl_target_lens.size();
+    for (int i = 0; i < cfg.ntarget_len; i++)
+        cfg.target_lens[i] = wl_target_lens[i];
     cfg.words = wl_words;
     cfg.wordmemb = wl_memb;
     {
@@ -2559,9 +2603,9 @@ int main(int argc, char** argv)
 
     /* Combined match probability across all patterns (treated as mutually
        exclusive, which holds unless patterns overlap each other). A first-word
-       pattern is not a match on its own: it stands for every target_len pair
-       starting with that word, so it contributes (number of words of the
-       complementary length) * 32^-target_len. stage1_sum is the separate rate
+       pattern is not a match on its own: it stands for every pair starting
+       with that word, so for each target length T it contributes (number of
+       words of length T - first) * 32^-T. stage1_sum is the separate rate
        at which a pattern fires and pulls its whole warp into the second stage
        - worth reporting, because short first words make that the dominant cost
        long before the pattern count does. */
@@ -2577,10 +2621,15 @@ int main(int argc, char** argv)
             prob_sum += pow(32.0, -(double)plen);
             effective_patterns += 1;
         } else {
-            int comp = cfg.target_len - (int)(cfg.ftinfo[p] & 31u);
-            uint64_t n2 = (uint64_t)wl_cnt_memb[comp][cfg.ftinfo[p] >> 5];
-            prob_sum += (double)n2 * pow(32.0, -(double)cfg.target_len);
-            effective_patterns += n2;
+            for (int ti = 0; ti < cfg.ntarget_len; ti++) {
+                int T = cfg.target_lens[ti];
+                int comp = T - (int)(cfg.ftinfo[p] & 31u);
+                if (comp < 1 || comp > MAX_WORD_LEN)
+                    continue;
+                uint64_t n2 = (uint64_t)wl_cnt_memb[comp][cfg.ftinfo[p] >> 5];
+                prob_sum += (double)n2 * pow(32.0, -(double)T);
+                effective_patterns += n2;
+            }
             nfirst_words++;
         }
     }
@@ -2633,10 +2682,13 @@ int main(int argc, char** argv)
 
         if (benchmark) {
             printf("mode    : benchmark (~%.0f s)\n", bench_secs);
-        } else if (cfg.target_len > 0) {
+        } else if (cfg.ntarget_len > 0) {
+            std::string lens;
+            for (int ti = 0; ti < cfg.ntarget_len; ti++)
+                lens += (ti ? "/" : "") + std::to_string(cfg.target_lens[ti]);
             printf("wordlist: %zu distinct A+B words, %d usable as the first half"
-                   " of a %d-char pair\n",
-                   cfg.words.size(), nfirst_words, cfg.target_len);
+                   " of a %s-char pair\n",
+                   cfg.words.size(), nfirst_words, lens.c_str());
             printf("prefixes: %llu effective patterns from %d device patterns"
                    " (expected ~%.3g keys per match)\n",
                    (unsigned long long)effective_patterns, cfg.nprefixes, expected);
