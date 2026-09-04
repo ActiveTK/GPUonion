@@ -111,6 +111,13 @@ __constant__ int c_bucket_idx[MAX_PREFIXES];
    is affordable precisely because there are few of them. The host picks the
    lengths by minimizing the predicted pass rate, so a set with no short
    patterns still collapses to a single long key and a single probe. */
+/* Set by CMake's GPUONION_ALL_BATCH_SIZES option. Off, only the -B 512
+   instantiation of each search kernel is compiled, which is what the default
+   run uses and cuts nvcc time by roughly the number of sizes dropped. */
+#ifndef GPUONION_ALL_BATCH_SIZES
+#define GPUONION_ALL_BATCH_SIZES 0
+#endif
+
 #define BLOOM_LOG2_BITS 17
 #define BLOOM_BITS (1u << BLOOM_LOG2_BITS)
 #define BLOOM_WORDS (BLOOM_BITS >> 5) /* 4096 words = 16 KB of shared memory */
@@ -1988,35 +1995,73 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
         if (mode == 0) {
             MontState4* p = (MontState4*)d_state;
             switch (batch) {
+#if GPUONION_ALL_BATCH_SIZES
             case 8:  k_search_mont4<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 16: k_search_mont4<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 32: k_search_mont4<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 64: k_search_mont4<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 128: k_search_mont4<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 256: k_search_mont4<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
             case 512: k_search_mont4<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#if GPUONION_ALL_BATCH_SIZES
             case 1024: k_search_mont4<1024><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
             }
         } else if (mode == 2) {
             ge25519* p = (ge25519*)d_state;
             switch (batch) {
+#if GPUONION_ALL_BATCH_SIZES
             case 8:  k_search<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 16: k_search<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 32: k_search<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 64: k_search<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 128: k_search<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 256: k_search<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
             case 512: k_search<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
             }
         } else {
             MontState* p = (MontState*)d_state;
             switch (batch) {
+#if GPUONION_ALL_BATCH_SIZES
             case 8:  k_search_mont<8><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 16: k_search_mont<16><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 32: k_search_mont<32><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 64: k_search_mont<64><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 128: k_search_mont<128><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
+#if GPUONION_ALL_BATCH_SIZES
             case 256: k_search_mont<256><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
+#endif
             case 512: k_search_mont<512><<<blocks, tpb, search_shmem>>>(p, T, nbatch, ib, d_count, d_found); break;
             }
         }
@@ -2193,7 +2238,8 @@ static void usage(const char* argv0)
             "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
             "  -t <threads>   threads per block (default 256)\n"
             "  -i <iters>     candidates per thread per launch (default 512)\n"
-            "  -B <batch>     Montgomery inversion batch size: 8..512 (default 128)\n"
+            "  -B <batch>     Montgomery inversion batch size (default 512; other powers of\n"
+            "                 two in 8..1024 need a -DGPUONION_ALL_BATCH_SIZES=ON build)\n"
             "  --m51          use the 5x51-limb Montgomery kernel (for A/B)\n"
             "  --ext          use Edwards extended-coordinate stepping (slower; for A/B)\n"
             "  --selftest     run internal tests only\n",
@@ -2557,6 +2603,18 @@ int main(int argc, char** argv)
         fprintf(stderr, "batch 1024 is only supported by the default (fe4) kernel\n");
         return 1;
     }
+#if !GPUONION_ALL_BATCH_SIZES
+    /* only the default batch size is compiled in: every extra instantiation
+       of the three search kernels adds minutes to nvcc's ptxas time, and 512
+       is what every GPU ends up using anyway */
+    if (batch != 512) {
+        fprintf(stderr,
+                "batch %d is not compiled into this binary (only 512 is); rebuild with\n"
+                "  cmake -B build -DGPUONION_ALL_BATCH_SIZES=ON\n"
+                "to get the other sizes\n", batch);
+        return 1;
+    }
+#endif
 
     /* resolve device_arg into a concrete list: "all" -> every visible GPU,
        "a,b,c" -> that list, otherwise a single index (default "0") */
