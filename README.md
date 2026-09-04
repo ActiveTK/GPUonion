@@ -24,6 +24,10 @@ Up to 50 GKey/s @ 8x RTX 5090 ($3.5/hr on [vast.ai](https://cloud.vast.ai/?ref_i
 | 13 | ~3.69×10¹⁹ | 23.4 years | $717,000 |
 | 14 | ~1.18×10²¹ | 748 years | $23 million |
 
+## How to use
+
+Ask fable `Yo my best friend fable plz tell me how to use ActiveTK/GPUonion?`
+
 ## Algorithm
 
 - Starting from a random clamped scalar `a0`, the `i`-th candidate of thread `t` is
@@ -54,6 +58,7 @@ much faster:
 
 ```bash
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90   # H100 only
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=120  # for RTX 5090
 ```
 
 ### Windows (development environment)
@@ -83,6 +88,7 @@ cmake --build build --config Release
   --m51          use the 5x51 limb kernel (for A/B comparison)
   --ext          use the Edwards extended-coordinate kernel (for A/B comparison, slowest)
   --selftest     run the internal tests only
+  and so on (see --help)
 ```
 
 See [Optimize.md](Optimize.md) for the optimization history and the effect of each technique.
@@ -90,7 +96,7 @@ See [Optimize.md](Optimize.md) for the optimization history and the effect of ea
 Example:
 
 ```bash
-./gpuonion claude
+./gpuonion activetkkami
 ```
 
 Benchmark (measures with a 16-character prefix that never matches, and also prints the expected time per prefix length):
@@ -104,21 +110,6 @@ Output is saved under `found/<address>/` in a format Tor can read directly:
 - `hostname`
 - `hs_ed25519_secret_key` (place it in `HiddenServiceDir` to use it)
 - `hs_ed25519_public_key`
-
-## Performance guide
-
-| GPU | Speed |
-|---|---|
-| RTX 4070 (sm_89) | ~2.7 GKey/s (sustained) |
-| H100 (sm_90) | ~5-6 GKey/s (estimated from the INT throughput ratio) |
-
-The expected number of trials is `32^len`. Measured on an RTX 4070, a 6-character
-prefix takes ~0.4 s on average, 7 characters ~13 s, 8 characters ~7 min, and
-9 characters ~3.6 hours.
-
-The implementation uses Montgomery x-only differential addition (3M+2S per
-candidate) + batch inversion + 4×64-bit limbs with lazy reduction (PTX madc
-chains). Details in [Optimize.md](Optimize.md).
 
 ## Notes
 
