@@ -2345,14 +2345,23 @@ int main(int argc, char** argv)
             std::vector<std::pair<size_t, std::string>> bylen;
             for (const auto& kv : memb)
                 bylen.push_back({kv.first.size(), kv.first});
-            /* by length first, then lexicographically - which for base32 is
-               the same order as the packed keys stage 2 binary searches */
+            /* by length first, then in base32 alphabet order (a..z then 2..7)
+               - the order of the packed keys stage 2 binary searches. Plain
+               ASCII order is NOT the same: digits sort before letters there,
+               so any bucket holding a word with a digit would not be sorted
+               by key and the binary search would miss words in it. */
+            auto b32_order = [](const std::string& s) {
+                std::string k = s;
+                for (auto& c : k)
+                    c = (char)(strchr(ONION_B32, c) - ONION_B32);
+                return k;
+            };
             std::stable_sort(bylen.begin(), bylen.end(),
-                             [](const std::pair<size_t, std::string>& x,
-                                const std::pair<size_t, std::string>& y) {
+                             [&](const std::pair<size_t, std::string>& x,
+                                 const std::pair<size_t, std::string>& y) {
                                  if (x.first != y.first)
                                      return x.first < y.first;
-                                 return x.second < y.second;
+                                 return b32_order(x.second) < b32_order(y.second);
                              });
             for (const auto& e : bylen) {
                 wl_words.push_back(e.second);
