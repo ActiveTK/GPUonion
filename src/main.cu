@@ -78,24 +78,37 @@ __constant__ uint64_t c_m0[MAX_PREFIXES];
    sentinel); c_bucket_idx holds prefix indices grouped by bucket. */
 __constant__ int c_bucket_start[33];
 __constant__ int c_bucket_idx[MAX_PREFIXES];
-/* Bloom prefilter over the shortest configured prefix.
-   The bucket scan above is fine for a handful of patterns but collapses at
-   scale: the bucket is chosen from the candidate's own leading character, so
-   threads in a warp read different constant-memory addresses and those loads
-   serialize 32 ways, and with 1000 prefixes over 32 buckets each scan still
-   walks ~31 patterns. Every real match must agree with some pattern on the
-   bits of the shortest prefix, so hash those bits and test two bits of a
-   64Kbit Bloom filter kept in shared memory: one uniform, non-divergent probe
-   rejects ~99.9% of candidates in constant time no matter how many prefixes
-   are configured. Survivors fall through to the exact bucket scan. */
-#define BLOOM_LOG2_BITS 16
+/* Bloom prefilter.
+   The bucket scan is fine for a handful of patterns but collapses at scale:
+   every lane that reaches it walks its own bucket at its own scattered
+   indices, so a single warp iteration issues up to 32 separate memory
+   transactions and the scan costs the warp far more than its instruction
+   count suggests. Measured on an RTX 4070, a warp that enters the scan costs
+   on the order of 300 candidates' worth of elapsed time. Everything therefore
+   depends on not entering it: throughput tracks 1 + ~300 * P(any lane in the
+   warp survives the prefilter) across the whole range, and the pass rate is
+   the only lever that matters.
+
+   A filter is only as selective as the number of characters it keys on. One
+   mask for all patterns has to be the shortest pattern's, so a single
+   3-character word keys the whole filter on 15 bits: ~1800 patterns in 32768
+   slots let 5% of candidates through and the filter stops working. Instead
+   key at up to BLOOM_GROUPS different lengths, each pattern keyed at the
+   longest of them it can fill, and probe once per length. Patterns shorter
+   than the shortest key length are inserted as all of their extensions, which
+   is affordable precisely because there are few of them. The host picks the
+   lengths by minimizing the predicted pass rate, so a set with no short
+   patterns still collapses to a single long key and a single probe. */
+#define BLOOM_LOG2_BITS 17
 #define BLOOM_BITS (1u << BLOOM_LOG2_BITS)
-#define BLOOM_WORDS (BLOOM_BITS >> 5) /* 2048 words = 8 KB of shared memory */
-/* mask of the bits every pattern constrains (AND of all c_m0), i.e. the bits
-   of the shortest prefix - the only bits the filter may key on */
-__constant__ uint64_t c_bloom_mask;
+#define BLOOM_WORDS (BLOOM_BITS >> 5) /* 4096 words = 16 KB of shared memory */
+#define BLOOM_GROUPS 4
+#define BLOOM_HASHES 4
+/* one limb-0 mask per key length in use, and how many are in use */
+__constant__ uint64_t c_bloom_mask[BLOOM_GROUPS];
+__constant__ int c_bloom_groups;
 /* 0 for small prefix sets, where the direct bucket scan is already cheaper
-   than staging the table into shared memory */
+   than staging the table */
 __constant__ uint32_t c_use_bloom;
 __device__ uint32_t g_bloom[BLOOM_WORDS];
 
@@ -132,6 +145,16 @@ __constant__ int c_wl_end[32];
    candidate - and it keeps the constant budget exactly where it was. */
 __device__ uint8_t g_wordchars[MAX_PREFIXES][MAX_WORD_LEN];
 __device__ uint8_t g_wordmemb[MAX_PREFIXES];
+/* Words of at most WORD_KEY_MAX characters also live as one packed 5-bits-per
+   character integer, most significant character first, sorted ascending
+   within each length bucket. That turns stage 2 from a linear walk of the
+   bucket - up to a few hundred scattered byte loads, and the whole warp pays
+   for one lane's - into a binary search over a contiguous array. It matters:
+   once the prefilter is doing its job, nearly everything that survives is a
+   genuine short-word hit, so the word lookup, not the prefilter, is what the
+   surviving warps spend their time on. */
+#define WORD_KEY_MAX 12 /* 12 * 5 = 60 bits */
+__device__ uint64_t g_wordkey[MAX_PREFIXES];
 
 __constant__ fe c_msp;
 __constant__ fe c_msm;
@@ -197,8 +220,29 @@ __device__ __noinline__ bool word_tail_match(const uint8_t pk[32], int p, uint32
     int tl = c_target_len - ft;
     if (tl < 1 || tl > MAX_WORD_LEN)
         return false;
-    int end = c_wl_end[tl];
-    for (int w = c_wl_start[tl]; w < end; w++) {
+    int lo = c_wl_start[tl], hi = c_wl_end[tl];
+    if (tl <= WORD_KEY_MAX) {
+        /* pack the tail the same way the host packed the words, then binary
+           search the bucket; keys are unique within a length because the word
+           table is de-duplicated, so at most one word can match */
+        uint64_t key = 0;
+        for (int j = 0; j < tl; j++)
+            key = (key << 5) | (uint64_t)b32_char(pk, ft + j);
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (g_wordkey[mid] < key)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < c_wl_end[tl] && g_wordkey[lo] == key && (g_wordmemb[lo] & need)) {
+            w2 = (uint32_t)lo;
+            return true;
+        }
+        return false;
+    }
+    /* longer than one packed key can hold: fall back to the byte compare */
+    for (int w = lo; w < hi; w++) {
         if (!(g_wordmemb[w] & need))
             continue; /* right length, wrong list - would be an A+A or B+B pair */
         bool ok = true;
@@ -247,31 +291,40 @@ __host__ __device__ __forceinline__ uint32_t bloom_hash(uint64_t key)
     return x;
 }
 
-/* The four bit positions pattern/candidate `key` sets or tests. Four, not
-   two, because 64 Kbit over a few thousand patterns leaves ~16-32 bits per
-   entry, where two hashes are far off the optimum: at 2000 patterns k=2 lets
-   1.05e-2 of candidates through and k=4 only 5.4e-4, measured. That matters
-   out of all proportion to its instruction count - see quick_any. Two 32-bit
-   finalizations give all 64 bits of index material. */
-__host__ __device__ __forceinline__ void bloom_slots(uint64_t key, uint32_t slot[4])
+/* Keys from different groups live in one table, so the group index is mixed
+   in to keep two groups from aliasing on the same numeric key. */
+__host__ __device__ __forceinline__ uint64_t bloom_group_key(uint64_t masked, int g)
+{
+    return masked + (uint64_t)g * 0x9e3779b97f4a7c15ull;
+}
+
+/* The BLOOM_HASHES bit positions a key sets or tests. Double hashing rather
+   than slicing one 32-bit word: at 2^17 bits four indices need 68 bits, more
+   than one hash has, and an odd stride keeps the probes distinct in a
+   power-of-two table. Four, not two, because a few thousand patterns in
+   128 Kbit leaves enough room that k=2 is far off the optimum - at 2000
+   patterns k=2 passes 1.05e-2 of candidates and k=4 only 5.4e-4, measured. */
+__host__ __device__ __forceinline__ void bloom_slots(uint64_t key, uint32_t slot[BLOOM_HASHES])
 {
     uint32_t h1 = bloom_hash(key);
-    uint32_t h2 = bloom_hash(key ^ 0x9e3779b97f4a7c15ull);
-    slot[0] = h1 & (BLOOM_BITS - 1);
-    slot[1] = (h1 >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
-    slot[2] = h2 & (BLOOM_BITS - 1);
-    slot[3] = (h2 >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
+    uint32_t h2 = bloom_hash(key ^ 0x9e3779b97f4a7c15ull) | 1u;
+    for (int i = 0; i < BLOOM_HASHES; i++)
+        slot[i] = (h1 + (uint32_t)i * h2) & (BLOOM_BITS - 1);
 }
 
 __device__ __forceinline__ bool bloom_probe(const uint32_t* __restrict__ tbl, uint64_t y0)
 {
-    uint32_t slot[4];
-    bloom_slots(y0 & c_bloom_mask, slot);
-    uint32_t a = tbl[slot[0] >> 5] >> (slot[0] & 31);
-    uint32_t b = tbl[slot[1] >> 5] >> (slot[1] & 31);
-    uint32_t c = tbl[slot[2] >> 5] >> (slot[2] & 31);
-    uint32_t d = tbl[slot[3] >> 5] >> (slot[3] & 31);
-    return (a & b & c & d & 1u) != 0;
+    bool hit = false;
+    /* c_bloom_groups is grid-uniform, so this loop is uniform too */
+    for (int g = 0; g < c_bloom_groups; g++) {
+        uint32_t slot[BLOOM_HASHES];
+        bloom_slots(bloom_group_key(y0 & c_bloom_mask[g], g), slot);
+        uint32_t acc = 1u;
+        for (int i = 0; i < BLOOM_HASHES; i++)
+            acc &= tbl[slot[i] >> 5] >> (slot[i] & 31);
+        hit |= (acc & 1u) != 0;
+    }
+    return hit;
 }
 
 /* Hot-path reject: Bloom probe when the prefix set is big enough to warrant
@@ -635,17 +688,19 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
             fe4_mul(y, Ms[k], inv);
             if (k > 0)
                 fe4_mul(inv, inv, Ds[k]);
-            /* y is lazy: value is y_true + j*p for j in {0,1,2}, and limb 0 of
-               y_true is then y[0] + 19j (mod 2^64). The offset changes the
-               hashed key, so each of the 3 candidate values needs its own
-               probe - six shared-memory loads total, still constant work, and
-               canonicalization stays off the hot path. */
-            uint64_t y0 = y[0];
-            bool maybe = quick_any(s_bloom, y0) | quick_any(s_bloom, y0 + 19) |
-                         quick_any(s_bloom, y0 + 38);
-            if (maybe) {
-                fe4_canon(y);
-                uint64_t yc = y[0];
+            /* Canonicalize before probing rather than after. y is lazy - its
+               value is y_true + j*p for j in {0,1,2}, so limb 0 is y[0] + 19j
+               - and a filter keyed on limb 0 would otherwise have to probe all
+               three offsets. That costs three times the probe work, and, worse,
+               three times the survivor rate: the two bogus offsets are
+               effectively random 51-bit values, so they clear the filter
+               structurally exactly as often as the real one does, and a
+               survivor drags its whole warp into the pattern scan. fe4_canon
+               is ~26 instructions against ~1700 for the candidate itself, so
+               it pays for itself twice over. */
+            fe4_canon(y);
+            uint64_t yc = y[0];
+            if (quick_any(s_bloom, yc)) {
                 uint8_t pk[32];
                 fe4_tobytes(pk, y);
                 int bk = (int)((yc >> 3) & 0x1F);
@@ -1144,6 +1199,7 @@ struct RunConfig {
     std::vector<std::string> words;  /* merged A+B, ordered by character length */
     std::vector<uint8_t> wordchars;  /* the same, base32 values, MAX_WORD_LEN per word */
     std::vector<uint8_t> wordmemb;   /* per word: WORD_IN_A | WORD_IN_B */
+    std::vector<uint64_t> wordkey;   /* the same, packed 5 bits per character */
     int wl_start[32];
     int wl_end[32];
 };
@@ -1160,6 +1216,164 @@ static void resolve_launch(const RunConfig& cfg, const cudaDeviceProp& prop, int
         tpb = 128;
     if (blocks <= 0)
         blocks = prop.multiProcessorCount * 16;
+}
+
+/* What the prefilter will be: which key lengths, the masks that select them,
+   the populated table, and the pass rate the choice is predicted to give.
+   Built by plan_bloom() so the startup banner and every worker agree. */
+struct BloomPlan {
+    int ngroups = 0;
+    int key_len[BLOOM_GROUPS] = {0};
+    uint64_t mask[BLOOM_GROUPS] = {0};
+    double pass = 0.0;      /* predicted fraction of candidates that survive */
+    double insertions = 0.0;/* entries in the table, expansions included */
+    uint32_t use_bloom = 0;
+    std::vector<uint32_t> table;
+};
+
+/* limb-0 (bits 0..50) view of a byte-level target or mask */
+static uint64_t limb0_of(const uint8_t b[32])
+{
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--)
+        v = (v << 8) | b[i];
+    return v & FE_M51;
+}
+
+/* Chooses the prefilter's key lengths and builds its table. Keying every
+   pattern at the shortest one's length - the only option with a single mask -
+   means one short word destroys the filter for everything else, so instead
+   try every set of up to BLOOM_GROUPS key lengths and keep the one with the
+   lowest predicted pass rate. A pattern is keyed at the longest chosen length
+   it can fill; one shorter than every chosen length is inserted as all of its
+   extensions, which is affordable exactly because such patterns are rare.
+   With no short patterns the search naturally lands on a single long key and
+   a single probe, so the common case pays nothing for the machinery. */
+static void plan_bloom(const RunConfig& cfg, const uint64_t* t0, BloomPlan& out)
+{
+    const int KEY_LEN_MAX = 10;        /* 10 chars = 50 bits, all limb 0 holds */
+    const double INSERT_BUDGET = 60000.0;
+
+    /* limb-0 mask of an L-character prefix, and the limb-0 bits a character
+       value contributes at a given position - enough to build any extension
+       key without going back through the byte-level encoder */
+    uint64_t len_mask[KEY_LEN_MAX + 1];
+    static uint64_t charbit[KEY_LEN_MAX][32];
+    {
+        uint8_t tt[32], mm[32];
+        len_mask[0] = 0;
+        for (int L = 1; L <= KEY_LEN_MAX; L++) {
+            std::string dummy(L, 'a');
+            prefix_to_mask(dummy.c_str(), tt, mm);
+            len_mask[L] = limb0_of(mm);
+        }
+        for (int pos = 0; pos < KEY_LEN_MAX; pos++)
+            for (int v = 0; v < 32; v++) {
+                std::string dummy(pos, 'a');
+                dummy += ONION_B32[v];
+                prefix_to_mask(dummy.c_str(), tt, mm);
+                charbit[pos][v] = limb0_of(tt);
+            }
+    }
+
+    std::vector<int> plen(cfg.nprefixes);
+    for (int p = 0; p < cfg.nprefixes; p++)
+        plen[p] = (int)cfg.prefixes[p].size();
+
+    double best_pass = 1e300;
+    int best[BLOOM_GROUPS] = {0}, best_n = 0;
+    double best_ins = 0.0;
+    for (int a = 1; a <= KEY_LEN_MAX; a++)
+        for (int b = a; b <= KEY_LEN_MAX; b++)
+            for (int c = b; c <= KEY_LEN_MAX; c++)
+            for (int d = c; d <= KEY_LEN_MAX; d++) {
+                int uniq[BLOOM_GROUPS];
+                int u = 0;
+                uniq[u++] = a;
+                if (b > a)
+                    uniq[u++] = b;
+                if (c > b)
+                    uniq[u++] = c;
+                if (d > c)
+                    uniq[u++] = d;
+
+                double ins_g[BLOOM_GROUPS] = {0.0};
+                double total = 0.0;
+                for (int q = 0; q < cfg.nprefixes; q++) {
+                    int gi = 0;
+                    for (int i = 0; i < u; i++)
+                        if (uniq[i] <= plen[q])
+                            gi = i;
+                    double mult = plen[q] < uniq[gi] ? pow(32.0, uniq[gi] - plen[q]) : 1.0;
+                    ins_g[gi] += mult;
+                    total += mult;
+                    if (total > INSERT_BUDGET)
+                        break;
+                }
+                if (total > INSERT_BUDGET)
+                    continue;
+
+                double structural = 0.0;
+                for (int i = 0; i < u; i++)
+                    structural += ins_g[i] * pow(32.0, -(double)uniq[i]);
+                double load = (double)BLOOM_HASHES * total / (double)BLOOM_BITS;
+                double fp = pow(1.0 - exp(-load), (double)BLOOM_HASHES);
+                /* one probe per group per candidate, on the canonical value */
+                double pass = structural + (double)u * fp;
+                if (pass < best_pass) {
+                    best_pass = pass;
+                    best_n = u;
+                    best_ins = total;
+                    for (int i = 0; i < u; i++)
+                        best[i] = uniq[i];
+                }
+            }
+
+    out.ngroups = best_n;
+    out.pass = best_pass;
+    out.insertions = best_ins;
+    for (int i = 0; i < best_n; i++) {
+        out.key_len[i] = best[i];
+        out.mask[i] = len_mask[best[i]];
+    }
+    out.use_bloom = (cfg.nprefixes > 8 && best_n > 0) ? 1u : 0u;
+    out.table.assign(BLOOM_WORDS, 0u);
+    if (!out.use_bloom)
+        return;
+
+    for (int q = 0; q < cfg.nprefixes; q++) {
+        int gi = 0;
+        for (int i = 0; i < best_n; i++)
+            if (best[i] <= plen[q])
+                gi = i;
+        int L = best[gi];
+        auto insert = [&](uint64_t key) {
+            uint32_t slot[BLOOM_HASHES];
+            bloom_slots(bloom_group_key(key & out.mask[gi], gi), slot);
+            for (int r = 0; r < BLOOM_HASHES; r++)
+                out.table[slot[r] >> 5] |= 1u << (slot[r] & 31);
+        };
+        if (plen[q] >= L) {
+            insert(t0[q]);
+            continue;
+        }
+        /* shorter than its key length: insert every extension, so the filter
+           still keys on L characters for everything else */
+        int freec = L - plen[q];
+        uint64_t base = t0[q] & len_mask[plen[q]];
+        std::vector<int> odo(freec, 0);
+        for (;;) {
+            uint64_t key = base;
+            for (int j = 0; j < freec; j++)
+                key |= charbit[plen[q] + j][odo[j]];
+            insert(key);
+            int j = freec - 1;
+            while (j >= 0 && ++odo[j] == 32)
+                odo[j--] = 0;
+            if (j < 0)
+                break;
+        }
+    }
 }
 
 /* benchmark outcome for one GPU, filled in just before the worker returns;
@@ -1262,30 +1476,17 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
             bucket_idx[cursor[(cfg.target[p][0] >> 3) & 0x1F]++] = p;
     }
 
-    /* Bloom filter over the bits every pattern constrains. bloom_mask is the
-       AND of all the per-pattern limb-0 masks, which (masks being nested by
-       prefix length) is exactly the mask of the shortest configured prefix,
-       so a candidate that misses the filter cannot match any pattern. Only
-       worth its shared-memory staging once the bucket scan gets long. */
-    uint64_t bloom_mask = ~0ull;
-    for (int p = 0; p < cfg.nprefixes; p++)
-        bloom_mask &= m0[p];
-    uint32_t use_bloom = (cfg.nprefixes > 8 && bloom_mask != 0) ? 1u : 0u;
-    std::vector<uint32_t> bloom(BLOOM_WORDS, 0u);
-    if (use_bloom) {
-        for (int p = 0; p < cfg.nprefixes; p++) {
-            uint32_t slot[4];
-            bloom_slots(t0[p] & bloom_mask, slot);
-            for (int q = 0; q < 4; q++)
-                bloom[slot[q] >> 5] |= 1u << (slot[q] & 31);
-        }
-    }
-    const size_t search_shmem = use_bloom ? sizeof(uint32_t) * BLOOM_WORDS : 0;
+    /* prefilter: key lengths and table, chosen the same way for every device */
+    BloomPlan plan;
+    plan_bloom(cfg, t0, plan);
+    const size_t search_shmem = plan.use_bloom ? sizeof(uint32_t) * BLOOM_WORDS : 0;
 
-    CUDA_CHECK(cudaMemcpyToSymbol(c_bloom_mask, &bloom_mask, sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpyToSymbol(c_use_bloom, &use_bloom, sizeof(uint32_t)));
-    if (use_bloom)
-        CUDA_CHECK(cudaMemcpyToSymbol(g_bloom, bloom.data(), sizeof(uint32_t) * BLOOM_WORDS));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_bloom_mask, plan.mask, sizeof(plan.mask)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_bloom_groups, &plan.ngroups, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_use_bloom, &plan.use_bloom, sizeof(uint32_t)));
+    if (plan.use_bloom)
+        CUDA_CHECK(
+            cudaMemcpyToSymbol(g_bloom, plan.table.data(), sizeof(uint32_t) * BLOOM_WORDS));
     CUDA_CHECK(cudaMemcpyToSymbol(c_a0, a0, 32));
     CUDA_CHECK(cudaMemcpyToSymbol(c_nprefixes, &cfg.nprefixes, sizeof(int)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
@@ -1298,6 +1499,8 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     if (!cfg.wordchars.empty()) {
         CUDA_CHECK(cudaMemcpyToSymbol(g_wordchars, cfg.wordchars.data(), cfg.wordchars.size()));
         CUDA_CHECK(cudaMemcpyToSymbol(g_wordmemb, cfg.wordmemb.data(), cfg.wordmemb.size()));
+        CUDA_CHECK(cudaMemcpyToSymbol(g_wordkey, cfg.wordkey.data(),
+                                      sizeof(uint64_t) * cfg.wordkey.size()));
     }
     CUDA_CHECK(cudaMemcpyToSymbol(c_base, &hostB, sizeof(ge25519)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepp, stepp, sizeof(fe)));
@@ -1700,10 +1903,14 @@ int main(int argc, char** argv)
             std::vector<std::pair<size_t, std::string>> bylen;
             for (const auto& kv : memb)
                 bylen.push_back({kv.first.size(), kv.first});
+            /* by length first, then lexicographically - which for base32 is
+               the same order as the packed keys stage 2 binary searches */
             std::stable_sort(bylen.begin(), bylen.end(),
                              [](const std::pair<size_t, std::string>& x,
                                 const std::pair<size_t, std::string>& y) {
-                                 return x.first < y.first;
+                                 if (x.first != y.first)
+                                     return x.first < y.first;
+                                 return x.second < y.second;
                              });
             for (const auto& e : bylen) {
                 wl_words.push_back(e.second);
@@ -1770,10 +1977,17 @@ int main(int argc, char** argv)
             cfg.wl_end[L] = acc;
         }
         cfg.wordchars.assign(wl_words.size() * MAX_WORD_LEN, 0);
-        for (size_t i = 0; i < wl_words.size(); i++)
-            for (size_t j = 0; j < wl_words[i].size(); j++)
-                cfg.wordchars[i * MAX_WORD_LEN + j] =
-                    (uint8_t)(strchr(ONION_B32, wl_words[i][j]) - ONION_B32);
+        cfg.wordkey.assign(wl_words.size(), 0);
+        for (size_t i = 0; i < wl_words.size(); i++) {
+            uint64_t key = 0;
+            for (size_t j = 0; j < wl_words[i].size(); j++) {
+                uint8_t v = (uint8_t)(strchr(ONION_B32, wl_words[i][j]) - ONION_B32);
+                cfg.wordchars[i * MAX_WORD_LEN + j] = v;
+                if (j < WORD_KEY_MAX)
+                    key = (key << 5) | v;
+            }
+            cfg.wordkey[i] = key;
+        }
     }
     cfg.nprefixes = (int)raw_prefixes.size();
     for (int p = 0; p < cfg.nprefixes; p++) {
@@ -1877,6 +2091,18 @@ int main(int argc, char** argv)
     }
     double expected = prob_sum > 0.0 ? 1.0 / prob_sum : 0.0;
 
+    /* What the prefilter will do with this pattern set. Worth printing for
+       every mode, not just the wordlist one: the survivor rate is what
+       decides throughput, and it is set by the pattern lengths rather than
+       by anything the user can see directly. */
+    BloomPlan banner_plan;
+    {
+        std::vector<uint64_t> t0h(cfg.nprefixes);
+        for (int q = 0; q < cfg.nprefixes; q++)
+            t0h[q] = limb0_of(cfg.target[q]);
+        plan_bloom(cfg, t0h.data(), banner_plan);
+    }
+
     /* combined startup banner: group devices with identical name/SM count so
        a large fleet prints one line, not one block of text per GPU */
     {
@@ -1935,6 +2161,19 @@ int main(int argc, char** argv)
                 for (const auto& s : cfg.prefixes)
                     printf("            %s\n", s.c_str());
             }
+        }
+
+        if (banner_plan.use_bloom) {
+            printf("filter  : keys on ");
+            for (int i = 0; i < banner_plan.ngroups; i++)
+                printf("%s%d", i ? "+" : "", banner_plan.key_len[i]);
+            printf(" chars (%d probe%s, %.0f entries), ~%.2g of candidates survive\n",
+                   banner_plan.ngroups, banner_plan.ngroups == 1 ? "" : "s",
+                   banner_plan.insertions, banner_plan.pass);
+            if (banner_plan.pass > 1e-3)
+                printf("  WARNING: that survivor rate costs throughput - each one pulls a whole\n"
+                       "           warp into the pattern scan. The shortest patterns are the\n"
+                       "           cause; dropping them is worth far more than their coverage.\n");
         }
 
         uint32_t nb = (iters + (uint32_t)batch - 1) / (uint32_t)batch;
