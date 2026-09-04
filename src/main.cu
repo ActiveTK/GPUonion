@@ -229,24 +229,46 @@ __host__ __device__ __forceinline__ uint32_t bloom_hash(uint64_t key)
     return x;
 }
 
-/* the two bit positions pattern/candidate `key` sets or tests */
-__host__ __device__ __forceinline__ void bloom_slots(uint64_t key, uint32_t& i1, uint32_t& i2)
+/* The four bit positions pattern/candidate `key` sets or tests. Four, not
+   two, because 64 Kbit over a few thousand patterns leaves ~16-32 bits per
+   entry, where two hashes are far off the optimum: at 2000 patterns k=2 lets
+   1.05e-2 of candidates through and k=4 only 5.4e-4, measured. That matters
+   out of all proportion to its instruction count - see quick_any. Two 32-bit
+   finalizations give all 64 bits of index material. */
+__host__ __device__ __forceinline__ void bloom_slots(uint64_t key, uint32_t slot[4])
 {
-    uint32_t h = bloom_hash(key);
-    i1 = h & (BLOOM_BITS - 1);
-    i2 = (h >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
+    uint32_t h1 = bloom_hash(key);
+    uint32_t h2 = bloom_hash(key ^ 0x9e3779b97f4a7c15ull);
+    slot[0] = h1 & (BLOOM_BITS - 1);
+    slot[1] = (h1 >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
+    slot[2] = h2 & (BLOOM_BITS - 1);
+    slot[3] = (h2 >> BLOOM_LOG2_BITS) & (BLOOM_BITS - 1);
 }
 
 __device__ __forceinline__ bool bloom_probe(const uint32_t* __restrict__ tbl, uint64_t y0)
 {
-    uint32_t i1, i2;
-    bloom_slots(y0 & c_bloom_mask, i1, i2);
-    return ((tbl[i1 >> 5] >> (i1 & 31)) & (tbl[i2 >> 5] >> (i2 & 31)) & 1u) != 0;
+    uint32_t slot[4];
+    bloom_slots(y0 & c_bloom_mask, slot);
+    uint32_t a = tbl[slot[0] >> 5] >> (slot[0] & 31);
+    uint32_t b = tbl[slot[1] >> 5] >> (slot[1] & 31);
+    uint32_t c = tbl[slot[2] >> 5] >> (slot[2] & 31);
+    uint32_t d = tbl[slot[3] >> 5] >> (slot[3] & 31);
+    return (a & b & c & d & 1u) != 0;
 }
 
-/* hot-path reject: Bloom probe when the prefix set is big enough to warrant
+/* Hot-path reject: Bloom probe when the prefix set is big enough to warrant
    the table, plain bucket scan otherwise (c_use_bloom is grid-uniform, so the
-   branch costs nothing) */
+   branch costs nothing).
+
+   A survivor is far more expensive than its instruction count suggests. One
+   lane getting through drags its whole warp into the bucket scan, whose
+   c_bucket_idx/c_t0/c_m0 reads are scattered over tens of KB - well past the
+   constant cache - and sit in a dependent loop, so the misses serialize
+   instead of overlapping. Measured on an RTX 4070, a warp that enters the
+   scan costs on the order of 300 candidates' worth of elapsed time, and
+   throughput follows 1 + ~300 * P(any lane in the warp survives) closely
+   across the whole range. That is why the filter's false-positive rate, not
+   the pattern count, is what decides throughput at scale. */
 __device__ __forceinline__ bool quick_any(const uint32_t* __restrict__ bloom, uint64_t y0)
 {
     return c_use_bloom ? bloom_probe(bloom, y0) : bucket_quick_any(y0);
@@ -1214,10 +1236,10 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     std::vector<uint32_t> bloom(BLOOM_WORDS, 0u);
     if (use_bloom) {
         for (int p = 0; p < cfg.nprefixes; p++) {
-            uint32_t i1, i2;
-            bloom_slots(t0[p] & bloom_mask, i1, i2);
-            bloom[i1 >> 5] |= 1u << (i1 & 31);
-            bloom[i2 >> 5] |= 1u << (i2 & 31);
+            uint32_t slot[4];
+            bloom_slots(t0[p] & bloom_mask, slot);
+            for (int q = 0; q < 4; q++)
+                bloom[slot[q] >> 5] |= 1u << (slot[q] & 31);
         }
     }
     const size_t search_shmem = use_bloom ? sizeof(uint32_t) * BLOOM_WORDS : 0;
