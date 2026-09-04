@@ -863,8 +863,19 @@ static bool save_result(const std::string& outdir, const std::string& addr,
    so a result survives the instance being stopped. On failure the file still
    exists on local disk. Requires curl on PATH (present by default on
    Windows 10+ and typical Linux images). */
+/* --no-upload. Off by default and never set implicitly: a key that silently
+   fails to leave the machine is a lost key and a wasted search, so the only
+   way to stop an upload is to ask for it on the command line, and every
+   skipped upload still says so and names the local file. */
+static bool g_no_upload = false;
+
 static void curl_upload(const std::filesystem::path& local_path, const std::string& remote_name)
 {
+    if (g_no_upload) {
+        printf("  upload skipped (--no-upload), kept locally: %s\n",
+               local_path.string().c_str());
+        return;
+    }
     /* -F value quoted so paths with spaces survive; remote_name is either
        base32 + ".key"/".onion" or a generated log filename, so it needs no
        escaping itself */
@@ -1540,6 +1551,10 @@ static void usage(const char* argv0)
             "                 (elapsed time, rate, matches found so far) so\n"
             "                 progress survives the instance being stopped\n"
             "  -o <dir>       output directory (default ./found)\n"
+            "  --no-upload    do not upload found keys or status snapshots; keep\n"
+            "                 them in the output directory only. Every skipped\n"
+            "                 upload is reported, so a run that keeps its keys\n"
+            "                 local is never confused with one that uploaded.\n"
             "  --blocks <n>   blocks per launch (default: SMs * 8)\n"
             "  -t <threads>   threads per block (default 256)\n"
             "  -i <iters>     candidates per thread per launch (default 512)\n"
@@ -1580,6 +1595,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--keep-working-until-ctrlc")) keep_forever = true;
         else if (!strcmp(argv[i], "--upload-status-per-30min")) upload_status = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
+        else if (!strcmp(argv[i], "--no-upload")) g_no_upload = true;
         else if (!strcmp(argv[i], "--blocks") && i + 1 < argc) blocks = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) tpb = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) iters = (uint32_t)atoi(argv[++i]);
