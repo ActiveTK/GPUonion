@@ -1,4 +1,4 @@
-# GPUonion: The FASTEST GPU-based Onion Address Vanity
+# GPUonion: The FASTEST GPU-based Onion Address Vanity (thanks to my best friend Fable 5)
 
 A CUDA tool that searches for vanity addresses for Tor v3 onion services.
 It implements on the GPU the same scalar-increment approach used by
