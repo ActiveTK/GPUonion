@@ -1,273 +1,300 @@
-# GPUonion 高速化ログ
+# GPUonion Optimization Log
 
-環境: RTX 4070 (sm_89, 46 SM, 12GB), CUDA 12.8, Windows 11。
-計測はすべて `gpuonion -b`（ウォームアップ1回 + 20秒計測）。
+Environment: RTX 4070 (sm_89, 46 SMs, 12GB), CUDA 12.8, Windows 11.
+All measurements use `gpuonion -b` (1 warm-up run + 20-second measurement).
 
-## ベースライン (v1): 68.7 MKey/s
+## Baseline (v1): 68.7 MKey/s
 
-v1 の候補1件あたりのコスト:
+Cost per candidate in v1:
 
-- 汎用点加算 (add-2008-hwcd-3): 9M
-- **Z の逆元 (Fermat, 254sq + 11mul): ~265M ← 全体の 95%**
-- affine 化 + シリアライズ: 2M + tobytes ×2
+- Generic point addition (add-2008-hwcd-3): 9M
+- **Inversion of Z (Fermat, 254sq + 11mul): ~265M ← 95% of the total**
+- Affine conversion + serialization: 2M + tobytes ×2
 
-逆元が支配的。ここを潰すのが最初の本命。
+The inversion dominates. Eliminating it is the first main target.
 
-## Round 1: Montgomery バッチ逆元 + mixed add + limb0 比較
+## Round 1: Montgomery batch inversion + mixed add + limb0 comparison
 
 **68.7 → 952.8 MKey/s (13.9x)**
 
-変更点（累積で適用、個別計測はしていない）:
+Changes (applied cumulatively, not measured individually):
 
-1. **Montgomery バッチ逆元** — スレッドごとに B=32 候補分の (Y, Z, ΠZ) を
-   ローカルメモリに溜め、逆元1回を B 候補で償却。
-   候補あたり: ΠZ 蓄積 1M + 逆元 ~165M/B + 展開 2M + y=Y·zi 1M
-2. **専用 fe_sq** — squaring は 15 wide-mul(mul は 25)。逆元チェーンの
-   254 回の squaring が ~40% 軽くなる
-3. **mixed addition** — ステップ点 (8T)·B は固定なので affine 正規化して
-   (Sy+Sx, Sy−Sx, 2d·Sx·Sy) を constant memory にキャッシュ。9M → 7M
-4. **x 座標・符号ビット計算の除去** — pubkey の符号ビット (bit 255) は
-   prefix 照合に絶対に使われない（最長 30 文字 = 150 bit）。
-   照合には y だけあればよく、x の復元 (1M + tobytes) を丸ごと削除。
-   発見時の完全な鍵は CPU 側で再計算するので問題なし
-5. **limb0 直接比較** — y の下位 51 bit (base32 で 10.2 文字分) は
-   5×51bit 表現の limb0 そのもの。prefix ≤10 文字なら照合は
-   `(y0 ^ target) & mask` の 64bit 演算 1 回。それ以上の長さや
-   ~2^-50 の偽陽性だけバイト単位の完全照合へフォールバック
+1. **Montgomery batch inversion** — each thread accumulates (Y, Z, ΠZ) for
+   B=32 candidates in local memory and amortizes one inversion over B candidates.
+   Per candidate: ΠZ accumulation 1M + inversion ~165M/B + unwinding 2M + y=Y·zi 1M
+2. **Dedicated fe_sq** — squaring needs 15 wide multiplies (mul needs 25). The
+   254 squarings in the inversion chain get ~40% cheaper
+3. **Mixed addition** — the step point (8T)·B is fixed, so it is normalized to
+   affine and (Sy+Sx, Sy−Sx, 2d·Sx·Sy) is cached in constant memory. 9M → 7M
+4. **Removal of the x coordinate and sign-bit computation** — the sign bit of
+   the pubkey (bit 255) is never used for prefix matching (the longest prefix is
+   30 characters = 150 bits). Matching only needs y, so recovering x
+   (1M + tobytes) is dropped entirely. The full key is recomputed on the CPU
+   when a match is found, so nothing is lost
+5. **Direct limb0 comparison** — the low 51 bits of y (10.2 base32 characters)
+   are exactly limb0 of the 5×51-bit representation. For prefixes ≤10
+   characters, matching is a single 64-bit operation `(y0 ^ target) & mask`.
+   Longer prefixes and the ~2^-50 false positives fall back to a full
+   byte-wise comparison
 
-カーネル情報 (ptxas): 172 registers, spill 0, stack = 120B × B。
+Kernel info (ptxas): 172 registers, 0 spills, stack = 120B × B.
 
-## Round 2: パラメータスイープ
+## Round 2: Parameter sweep
 
-デフォルト (B=32, tpb=256, blocks=368=SM×8) から探索:
+Starting from the defaults (B=32, tpb=256, blocks=368=SM×8):
 
-| 変更 | MKey/s |
+| Change | MKey/s |
 |---|---|
 | B=8 | 570.8 |
 | B=16 | 826.0 |
-| B=32 (基準) | 946.3 |
+| B=32 (baseline) | 946.3 |
 | B=64 | 1085.0 |
 | B=128, tpb=128, blocks=736 | 1234.9 |
 | B=256, tpb=128, blocks=736 | 1308.2 |
 | **B=512, tpb=128, blocks=736** | **1331.5** |
 
-わかったこと:
+Findings:
 
-- **B はデカいほど勝つ**（逆元償却がローカルメモリ増を上回る）。
-  ただし 128→256 で +6%、256→512 で +1.8% と逓減
-- tpb=128 が 256 より良い（172 regs だと 128×3 ブロック = 384 スレッド/SM
-  常駐になり、256×1=256 スレッドより占有率が上がる）
-- blocks は 368〜1472 でほぼ不感
+- **Bigger B wins** (inversion amortization outweighs the extra local memory),
+  but with diminishing returns: +6% from 128→256, +1.8% from 256→512
+- tpb=128 beats 256 (with 172 registers, 128×3 blocks = 384 resident threads/SM,
+  which is higher occupancy than 256×1 = 256 threads)
+- blocks is almost insensitive between 368 and 1472
 
-### 失敗: -maxrregcount で占有率を買う
+### Failure: buying occupancy with -maxrregcount
 
-- `-maxrregcount=128`: 1170.8 MKey/s（素の 1234.9 より遅い）
+- `-maxrregcount=128`: 1170.8 MKey/s (slower than the plain 1234.9)
 - `-maxrregcount=96`: 1046.6 MKey/s
 
-レジスタを絞って占有率を上げても、スピルによるローカルメモリ往復の方が高くつく。
-**不採用**。
+Squeezing registers to raise occupancy costs more in spill traffic to local
+memory than it gains. **Rejected**.
 
-### 却下: ワープ協調のグランド逆元
+### Rejected: warp-cooperative grand inversion
 
-「32レーンの積をシャッフルでまとめて逆元1回に」という案を検討したが、
-SIMT では 32 レーンが同一の逆元を冗長計算しても 1 レーン分と同じ発行コスト。
-つまりスレッド毎バッチの逆元（各レーンが自分の値を並列に反転）が既に
-完璧な SIMD 償却であり、ワープ協調には**理論上の得が一切ない**。実装前に気づいて未実装。
+Considered "combine the products of 32 lanes with shuffles into a single
+inversion", but under SIMT, 32 lanes redundantly computing the same inversion
+costs the same issue slots as one lane. In other words the per-thread batch
+inversion (each lane inverting its own value in parallel) is already perfect
+SIMD amortization, and warp cooperation has **no theoretical gain at all**.
+Noticed before implementing; never implemented.
 
-## Round 3: Montgomery x-only 差分加算 — 1331.5 → 1619.1 MKey/s (+21.6%)
+## Round 3: Montgomery x-only differential addition — 1331.5 → 1619.1 MKey/s (+21.6%)
 
-参考リポジトリが主張する「y座標だけ計算する」方式の CUDA 版。
+A CUDA version of the "compute only the y coordinate" approach claimed by the
+reference repository.
 
-- Edwards y と Curve25519 の u は双有理写像 u = (1+y)/(1−y) で対応
-  (RFC 7748)。射影座標では **u = (Z+Y)/(Z−Y) なので変換に逆元不要**
-- ステップは Montgomery ladder の xADD（差分加算）:
-  P_{k+1} = P_k + S を P_{k−1} = P_k − S から計算。**4M + 2S**
-  （Edwards mixed add の 7M から削減。fe_sq=0.7M 換算で 7M → 5.4M 相当）
-- 候補の y は (U−W)/(U+W)。分母 D = U+W をバッチ逆元
-- スレッド状態は (U, W) と1つ前の (Um, Wm) の 4 fe
-- 初期化時に P_t に加えて P_t − S も計算（ge_add に −S を渡すだけ）
-- x 座標が完全に消えるので符号ビットは失われるが、照合に不要（Round 1 #4）で、
-  発見時はホストがスカラーから完全再計算するので問題なし
+- The Edwards y and the Curve25519 u are related by the birational map
+  u = (1+y)/(1−y) (RFC 7748). In projective coordinates
+  **u = (Z+Y)/(Z−Y), so the conversion needs no inversion**
+- Each step is the xADD (differential addition) of the Montgomery ladder:
+  P_{k+1} = P_k + S computed from P_{k−1} = P_k − S. **4M + 2S**
+  (down from the 7M of Edwards mixed add; with fe_sq counted as 0.7M,
+  7M → 5.4M equivalent)
+- The candidate y is (U−W)/(U+W). The denominator D = U+W goes through the batch inversion
+- Thread state is (U, W) plus the previous (Um, Wm): 4 field elements
+- At initialization, P_t − S is computed in addition to P_t (just pass −S to ge_add)
+- The x coordinate disappears entirely, so the sign bit is lost, but it is not
+  needed for matching (Round 1 #4), and the host recomputes everything from the
+  scalar on a hit, so this is fine
 
-同一条件 (B=512, tpb=128, blocks=736) の A/B:
+A/B under identical conditions (B=512, tpb=128, blocks=736):
 
-| カーネル | MKey/s |
+| Kernel | MKey/s |
 |---|---|
 | Edwards extended (--ext) | 1341.1 |
 | Montgomery x-only | **1619.1** |
 
-## Round 4: ホットパスのキャリー除去 — 1619.1 → 1656.7 MKey/s (+2.3%)
+## Round 4: Removing carries from the hot path — 1619.1 → 1656.7 MKey/s (+2.3%)
 
-5×51 表現は limb < 2^54 まで fe_mul/fe_sq の入力として安全（128bit
-アキュムレータの carry 抽出 (hi<<13) が壊れない）。xADD 内の加減算 4 箇所を
-キャリー伝播なしの fe_add_nc / fe_sub_nc に置換。
+In the 5×51 representation, limbs up to < 2^54 are safe as inputs to
+fe_mul/fe_sq (the carry extraction (hi<<13) of the 128-bit accumulator does not
+break). The 4 additions/subtractions inside xADD were replaced with
+fe_add_nc / fe_sub_nc, which do no carry propagation.
 
-### 失敗: pass1 ループの #pragma unroll 2
+### Failure: #pragma unroll 2 on the pass1 loop
 
-xADD の状態シフト（fe_copy ×4）をレジスタリネームで消せるかと期待したが、
-1656.7 → 1625.7 MKey/s (−1.9%)。コードサイズ増で I-cache/スケジューラが
-悪化した模様。**不採用**（unroll 1 に戻した）。
+Hoped that the state shift in xADD (fe_copy ×4) could be eliminated by register
+renaming, but 1656.7 → 1625.7 MKey/s (−1.9%). The larger code apparently hurt
+the I-cache/scheduler. **Rejected** (reverted to unroll 1).
 
-### 追試スイープ（Round 4 時点, mont 5x51）
+### Follow-up sweep (as of Round 4, mont 5x51)
 
 - tpb: 64:1633 / 96:1584 / **128:1640** / 192:1587 / 256:1538
-- blocks: 368〜2944 でほぼフラット（±2%）
-- iters: 512〜4096 でほぼフラット
-- → tpb=128, blocks=SM×16, iters=1024 をデフォルト化。パラメータは頭打ち
+- blocks: almost flat from 368 to 2944 (±2%)
+- iters: almost flat from 512 to 4096
+- → tpb=128, blocks=SM×16, iters=1024 became the defaults. Parameters have plateaued
 
-### 断念: Nsight Compute によるボトルネック特定
+### Abandoned: bottleneck identification with Nsight Compute
 
-`ERR_NVGPUCTRPERM` — GPU パフォーマンスカウンタは管理者権限の設定変更が
-必要なため断念。以後は経験的な A/B 測定で判断。
-（副産物: ncu 実行中に 1640→1580 とクロックのサーマルドリフトを観測。
-20 秒ベンチの数値には ±1.5% 程度の揺らぎがある）
+`ERR_NVGPUCTRPERM` — GPU performance counters require an administrator-level
+configuration change, so this was abandoned. From here on, decisions are based
+on empirical A/B measurements.
+(Side observation: while ncu was running, clock thermal drift was observed,
+1640→1580. The 20-second benchmark numbers fluctuate by about ±1.5%)
 
-## Round 5: PTX madc 連鎖 — 1656.7 → 1757.1 MKey/s (+6.1%)
+## Round 5: PTX madc chains — 1656.7 → 1757.1 MKey/s (+6.1%)
 
-fe_mac（128bit アキュムレータへの積和）を C++ の比較ベースキャリー
-（`hi += (lo < prev)`）から PTX インラインの
-`mad.lo.cc.u64 / madc.hi.u64` に、キャリー加算を `add.cc / addc` に置換。
-ptxas 任せだった SETP/SEL 系の命令列がハードウェアのキャリーフラグ連鎖になる。
+fe_mac (multiply-accumulate into a 128-bit accumulator) was changed from C++
+comparison-based carries (`hi += (lo < prev)`) to inline PTX
+`mad.lo.cc.u64 / madc.hi.u64`, and carry additions to `add.cc / addc`.
+The SETP/SEL instruction sequences that were left to ptxas become hardware
+carry-flag chains.
 
-## Round 6: 4x64 limb 表現 (fe4) — 1757.1 → 2158.0 MKey/s (+22.8%)
+## Round 6: 4x64 limb representation (fe4) — 1757.1 → 2158.0 MKey/s (+22.8%)
 
-VanitySearch 系 GPU bignum の定石構成に転換:
+Switched to the standard layout used by VanitySearch-style GPU bignums:
 
-- **fe4 = 4×64bit limbs、mod 2^256−38 (=2p) の遅延簡約**、値は [0, 2^256)
-- 乗算: 4×4 スクールブック（PTX madc 連鎖、512bit 中間）→ hi×38 折り畳み。
-  ワイド積 16+4 個（5×51 の 25 個から削減）、キャリーは全部 CC フラグ連鎖
-- 加減算: 4 limb チェーン + 38 補正（オーバーフロー/ボローの折り返しは
-  最大 2 回で必ず収束することを証明した上で分岐なし実装）
-- mod 2p の演算でも y = N/D mod p は最終 canonicalize（条件付き 2p, p 減算）
-  で正しく求まる。Fermat 逆元 a^(p−2) も mod 2p のまま実行可能
-  （結果の mod p 剰余は同じ）
-- 照合前の y だけ canonicalize。limb0 比較は 4×64 の方がむしろ自然
-  （y[0] の下位 51bit がそのまま使える）
-- ローカルメモリの batch 配列も 40B → 32B/fe に縮小（トラフィック −20%）
-- ホスト側にはポータブル C++ フォールバックを実装し、selftest で
-  5×51 実装と mul/add/sub/invert の一致を検証
+- **fe4 = 4×64-bit limbs, lazy reduction mod 2^256−38 (=2p)**, values in [0, 2^256)
+- Multiplication: 4×4 schoolbook (PTX madc chains, 512-bit intermediate) →
+  fold hi×38. 16+4 wide multiplies (down from 25 in 5×51), all carries in CC-flag chains
+- Addition/subtraction: 4-limb chain + 38 correction (implemented branch-free
+  after proving that the overflow/borrow wrap-around always converges within 2 rounds)
+- Even with arithmetic mod 2p, y = N/D mod p is obtained correctly by a final
+  canonicalization (conditional subtraction of 2p, then p). The Fermat inversion
+  a^(p−2) can also run mod 2p as-is (the residue mod p is the same)
+- Only the y used for matching is canonicalized. The limb0 comparison is even
+  more natural with 4×64 (the low 51 bits of y[0] are used directly)
+- The local-memory batch arrays also shrink from 40B → 32B per field element
+  (traffic −20%)
+- A portable C++ fallback is implemented on the host side, and the selftest
+  verifies that mul/add/sub/invert agree with the 5×51 implementation
 
-**レジスタが 168 → 128 に減少**し、SM あたり常駐 384 → 512 スレッドに。
-コンパクトなキャリー連鎖はレジスタ圧の面でも効く。
+**Registers dropped from 168 → 128**, raising resident threads per SM from
+384 → 512. Compact carry chains also help with register pressure.
 
-実装中に見つけて潰したバグ（初版の自分のコード）:
-- スクールブック最終行のキャリー欠落（lo チェーンの p7 伝播漏れ）
-- fold の最終キャリー脱落（~2^-245 の確率で 2^256 を失う）。
-  「wrap 後の値は必ず微小」という性質を使い、追い畳み 1 回で厳密化
+Bugs found and fixed during implementation (in my own first draft):
+- Missing carry in the last row of the schoolbook (p7 propagation lost in the lo chain)
+- Final carry dropped in the fold (loses 2^256 with probability ~2^-245).
+  Made exact with one extra fold, using the property that the value after
+  wrapping is always tiny
 
-## Round 7: fe4 カーネルの徹底削減 — 2158.0 → 2860.4 MKey/s (+32.5%)
+## Round 7: Aggressive reduction of the fe4 kernel — 2158.0 → 2860.4 MKey/s (+32.5%)
 
-3つの変更を同時投入:
+Three changes landed at once:
 
-1. **専用 fe4_sq** — クロス積 6 個を積んでから 512bit 全体を倍化し、
-   平方 4 個を 1 本の madc 連鎖で加算。ワイド積 16 → 10 個
-2. **xADD の射影スケーリング (κ トリック)** — xADD の 2 つの定数乗算
-   t1=N·(u_S+1), t2=D·(u_S−1) を両方 (u_S+1)^{-1} 倍しても
-   (U:W) は射影的に同一。κ = (u_S−1)/(u_S+1) を事前計算しておけば
-   t1 = N（乗算消滅!), t2 = D·κ となり **xADD が 4M+2S → 3M+2S**
-3. **バッチ配列 3 本 → 2 本** — pass1 で M_k = N_k·C_{k−1} を作って
-   おけば（乗算数は不変）、backward は y = M_k·inv と inv ×= D_k だけになり
-   C の配列が丸ごと不要に。ローカルメモリ往復 192B → 128B/候補
+1. **Dedicated fe4_sq** — accumulate the 6 cross products, double the whole
+   512-bit value, then add the 4 squares in a single madc chain. Wide
+   multiplies 16 → 10
+2. **Projective scaling of xADD (the κ trick)** — the two constant
+   multiplications in xADD, t1=N·(u_S+1) and t2=D·(u_S−1), can both be scaled
+   by (u_S+1)^{-1} and (U:W) stays projectively identical. With
+   κ = (u_S−1)/(u_S+1) precomputed, t1 = N (the multiplication vanishes!) and
+   t2 = D·κ, so **xADD goes from 4M+2S → 3M+2S**
+3. **Batch arrays 3 → 2** — if pass1 builds M_k = N_k·C_{k−1} (same number of
+   multiplications), the backward pass is just y = M_k·inv and inv ×= D_k, and
+   the C array is no longer needed at all. Local memory round trip
+   192B → 128B per candidate
 
-途中、fe4_sq の asm オペランド番号ミス（fe4_mul からのコピペで %6.. のまま）
-で nvcc が ICE を吐いた。オペランド番号を修正して解決。
+Along the way, an asm operand-numbering mistake in fe4_sq (still %6.. after
+copy-pasting from fe4_mul) made nvcc emit an ICE. Fixed by correcting the
+operand numbers.
 
-候補1件あたりの理論コスト: **7 mul + 2 sq ＝ ワイド積 約160個**
-（v1 は逆元込みで実質 ~280 fe_mul ≈ 7000 ワイド積。約 44 分の 1）
+Theoretical cost per candidate: **7 mul + 2 sq = about 160 wide multiplies**
+(v1 was effectively ~280 fe_mul ≈ 7000 wide multiplies including the
+inversion; about 1/44)
 
-### 参考: バッチサイズ再スイープ（fe4, tpb=128）
+### Reference: batch-size re-sweep (fe4, tpb=128)
 
-B=256: 2675 / B=512: 2690 / B=1024: 2773 MKey/s — ほぼフラット。
-連続ベンチでは ±3〜5% の揺らぎ（クロックブースト状態）があり、
-これ以上のパラメータ差は雑音に埋もれる。デフォルト B=512 に設定。
+B=256: 2675 / B=512: 2690 / B=1024: 2773 MKey/s — almost flat.
+Consecutive benchmarks fluctuate by ±3–5% (clock boost state), so parameter
+differences beyond this are buried in noise. Default set to B=512.
 
-### 再検討: ワープ協調グランド逆元
+### Reconsidered: warp-cooperative grand inversion
 
-Round 2 で「理論上無意味」と切ったが、それは誤り半分だったことに気づいた。
-逆元を速くする効果はゼロ（SIMD で各レーンが自分の値を並列反転するのが既に最適）
-だが、「B を小さくしてローカルメモリを L2 に収めつつ償却率を維持する」
-用途では有効（グランド積の逆元はワープ共有の単一値なので冗長計算がタダ）。
-ただし B=256〜1024 でフラットな実測から DRAM 律速ではないと判断し、**見送り**。
+Dismissed in Round 2 as "theoretically pointless", but that turned out to be
+half wrong. It has zero effect on making the inversion faster (each lane
+inverting its own value in parallel under SIMD is already optimal), but it is
+useful for "shrinking B so local memory fits in L2 while keeping the
+amortization ratio" (the inversion of the grand product is a single
+warp-shared value, so the redundant computation is free). However, since the
+flat measurements at B=256–1024 indicate we are not DRAM-bound, it was
+**deferred**.
 
-### 却下: 2-torsion 点の合流
+### Rejected: merging via the 2-torsion point
 
-u → 1/u が Montgomery 曲線上の「(0,0) の平行移動」であることを利用すると、
-候補 P から P+T2（y が −y になる点）の照合がほぼタダで手に入り
-スループット 2 倍に見える。しかし T2 は素数位数部分群の外にあり、
-P+T2 = aB + T2 には B を基底とする離散対数が存在しない
-（＝署名可能な秘密鍵が作れない）。**原理的に使用不可**。面白い罠だった。
+Using the fact that u → 1/u is "translation by (0,0)" on the Montgomery curve,
+matching P+T2 (the point whose y becomes −y) for a candidate P comes almost for
+free, which looks like doubling the throughput. But T2 lies outside the
+prime-order subgroup, and P+T2 = aB + T2 has no discrete logarithm with base B
+(i.e. no signing-capable secret key exists). **Fundamentally unusable**. An
+interesting trap.
 
-### 却下: Karatsuba / 8×32bit limb 化
+### Rejected: Karatsuba / 8×32-bit limbs
 
-- Karatsuba (4×64): 加減算とサイン処理の増分が madc スクールブックの
-  効率を食う。この語長では定石通り不利と判断
-- 8×32bit: ptxas が 64bit madc を IMAD.WIDE (32×32) に分解する時点で
-  実質同じ構成になる。手で書き直す意味がない
+- Karatsuba (4×64): the extra additions/subtractions and sign handling eat the
+  efficiency of the madc schoolbook. Judged unfavorable at this word size, as
+  is conventional
+- 8×32-bit: ptxas already decomposes 64-bit madc into IMAD.WIDE (32×32), which
+  yields effectively the same structure. No point rewriting by hand
 
-## Round 8: 遅延3比較
+## Round 8: Lazy 3-way comparison
 
-y の canonicalize（条件付き 2p/p 減算 ×2 パス）を照合ヒット時のみに遅延。
-lazy な y は y_true + jp (j∈{0,1,2}) で、limb0 は y0+19j (mod 2^64) と
-決まるので、3 通りの 64bit 比較で prefix 候補を拾ってから canon する。
-効果は測定誤差内（2708 vs 2690 MKey/s）だが理論的に損はないので採用。
+The canonicalization of y (2 passes of conditional 2p/p subtraction) is
+deferred until a match hits. The lazy y is y_true + jp (j∈{0,1,2}), so limb0 is
+determined as y0+19j (mod 2^64); prefix candidates are picked up with 3 64-bit
+comparisons and only then canonicalized. The effect is within measurement error
+(2708 vs 2690 MKey/s), but it cannot lose theoretically, so it was adopted.
 
-## Round 9: 失敗した占有率系の実験
+## Round 9: Failed occupancy experiments
 
-### 失敗: maxrregcount=96 (fe4)
+### Failure: maxrregcount=96 (fe4)
 
-128 レジスタ → 96 に絞って占有率 512→640 スレッド/SM を狙ったが、
-**2690 → 814 MKey/s (−70%)**。スピルがローカルメモリ往復に直撃。
-5×51 時代（−5〜15%）より遥かに悲惨で、fe4 カーネルは 128 レジスタが
-ちょうど均衡点だった。
+Tried to squeeze 128 registers → 96 to raise occupancy from 512→640
+threads/SM, but **2690 → 814 MKey/s (−70%)**. Spills hit local memory traffic
+directly. Far worse than in the 5×51 era (−5–15%); for the fe4 kernel, 128
+registers is exactly the equilibrium point.
 
-### 失敗: 2-way インターリーブ (--x2)
+### Failure: 2-way interleaving (--x2)
 
-1 物理スレッドが独立な 2 チェーンを進めて ILP を倍化する案。
-SASS が IMAD:IADD3 ≒ 1:1 で INT パイプ利用率 ~50% と推定されたため
-期待したが、**2316 MKey/s (−14%)**（B=256 では 2133）。
-状態+配列の倍増でレジスタ/キャッシュ圧が上がり、得られる ILP より
-占有率低下が勝った。実装は削除（この記録のみ残す）。
+The idea: one physical thread advances two independent chains to double ILP.
+The SASS showed IMAD:IADD3 ≈ 1:1 with an estimated INT pipe utilization of
+~50%, so it looked promising, but **2316 MKey/s (−14%)** (2133 at B=256).
+Doubling the state and arrays raised register/cache pressure, and the loss in
+occupancy outweighed the ILP gained. The implementation was removed (only this
+record remains).
 
-## 最終結果
+## Final results
 
-| 段階 | MKey/s | 累積倍率 |
+| Stage | MKey/s | Cumulative speedup |
 |---|---:|---:|
-| v1 素朴実装（毎候補 Fermat 逆元） | 68.7 | 1.0x |
-| + Montgomery バッチ逆元 / fe_sq / mixed add / limb0 比較 | 952.8 | 13.9x |
-| + パラメータ調整 (B=512, tpb=128) | 1331.5 | 19.4x |
-| + Montgomery x-only 差分加算 | 1619.1 | 23.6x |
-| + ホットパスのキャリー除去 | 1656.7 | 24.1x |
-| + PTX madc 連鎖 | 1757.1 | 25.6x |
-| + 4×64 limb (fe4) + 遅延簡約 | 2158.0 | 31.4x |
-| + 専用 fe4_sq + κトリック + 2配列化 | **~2716 (持続)** | **39.5x** |
+| v1 naive implementation (Fermat inversion per candidate) | 68.7 | 1.0x |
+| + Montgomery batch inversion / fe_sq / mixed add / limb0 comparison | 952.8 | 13.9x |
+| + parameter tuning (B=512, tpb=128) | 1331.5 | 19.4x |
+| + Montgomery x-only differential addition | 1619.1 | 23.6x |
+| + carry removal in the hot path | 1656.7 | 24.1x |
+| + PTX madc chains | 1757.1 | 25.6x |
+| + 4×64 limbs (fe4) + lazy reduction | 2158.0 | 31.4x |
+| + dedicated fe4_sq + κ trick + 2 arrays | **~2716 (sustained)** | **39.5x** |
 
-- 最終持続速度: **約 2.72 GKey/s (RTX 4070)**。瞬間値は 2.86 GKey/s まで観測
-- 7 文字 prefix (期待 34.4G keys) を実測 23.3 秒で発見
-- 8 文字 prefix の期待時間: 約 6.7 分 / 9 文字: 約 3.6 時間
-- 生成鍵は全段階で Python の純多倍長 ed25519 実装により独立検証済み
-  (scalar·B = pubkey, アドレス導出, clamp 形状)
+- Final sustained speed: **about 2.72 GKey/s (RTX 4070)**. Instantaneous values up to 2.86 GKey/s observed
+- A 7-character prefix (expected 34.4G keys) was found in a measured 23.3 seconds
+- Expected time for an 8-character prefix: about 6.7 minutes / 9 characters: about 3.6 hours
+- Generated keys were independently verified at every stage with a pure
+  big-integer ed25519 implementation in Python
+  (scalar·B = pubkey, address derivation, clamp shape)
 
-## H100 へのスケーリング見込み
+## Expected scaling to H100
 
-- カーネルは INT32 (IMAD/IADD3) 律速。H100 SXM は 132 SM × INT32 64/clk
-  × ~1.8GHz ≈ RTX 4070 (46SM × 2.7GHz) の約 2.0 倍の INT スループット
-  → **単純見積もりで 5〜6 GKey/s / GPU**
-- PTX インライン asm (mad/madc/add.cc) はアーキ非依存。sm_90 実バイナリ +
-  compute_90 PTX を fatbin に同梱済みで、Blackwell 以降も JIT で動く
-- ローカルメモリ使用: B=512 で 32KB/thread。H100 の大容量 L2 (50MB) と
-  HBM 帯域では B=1024 以上がさらに有利な可能性あり（要実測: `-B` で調整）
-- マルチGPU は `-d` でデバイスを指定してプロセス並列で回す設計
+- The kernel is INT32 (IMAD/IADD3) bound. H100 SXM has 132 SMs × 64 INT32/clk
+  × ~1.8GHz ≈ about 2.0x the INT throughput of an RTX 4070 (46 SMs × 2.7GHz)
+  → **a simple estimate gives 5–6 GKey/s per GPU**
+- The inline PTX asm (mad/madc/add.cc) is architecture-independent. The fatbin
+  already bundles an sm_90 native binary + compute_90 PTX, so Blackwell and
+  later run via JIT
+- Local memory usage: 32KB/thread at B=512. With the large L2 (50MB) and HBM
+  bandwidth of the H100, B=1024 or more may be even better (needs measurement: tune with `-B`)
+- Multi-GPU is designed to run as parallel processes with devices selected via `-d`
 
-## 試して採用しなかった/しないと決めたものまとめ
+## Summary of things tried and not adopted / decided against
 
-| 案 | 判断 |
+| Idea | Verdict |
 |---|---|
-| -maxrregcount による占有率買い | 実測で大幅悪化。不採用 |
-| #pragma unroll 2 | 実測 −1.9%。不採用 |
-| ワープ協調グランド逆元 | 逆元高速化としては理論的に無効。B縮小用としては有効だが DRAM 律速でないため見送り |
-| y-only (Edwards) 差分加算 | 導出したが 6S+8M で mixed add より重い。Montgomery x-only に軍配 |
-| 2-torsion 合流で候補2倍 | 部分群の外で秘密鍵が存在せず原理的に不可 |
-| Karatsuba / 8×32 limb | madc スクールブックと同等以下の見込み。未実装 |
-| FP32 パイプ併用 (float limb) | Ada の FP64 が 1/64 で正確性担保が困難。見送り |
-| 2-way インターリーブ | 実測 −14%。削除 |
-| Nsight Compute プロファイル | 権限不足で断念（管理者設定が必要） |
+| Buying occupancy with -maxrregcount | Measured much worse. Rejected |
+| #pragma unroll 2 | Measured −1.9%. Rejected |
+| Warp-cooperative grand inversion | Theoretically ineffective as an inversion speedup. Useful for shrinking B, but deferred since not DRAM-bound |
+| y-only (Edwards) differential addition | Derived, but 6S+8M is heavier than mixed add. Montgomery x-only wins |
+| Doubling candidates via 2-torsion merging | No secret key exists outside the subgroup; fundamentally impossible |
+| Karatsuba / 8×32 limbs | Expected to be no better than the madc schoolbook. Not implemented |
+| Using the FP32 pipe as well (float limbs) | FP64 on Ada runs at 1/64 rate, making correctness hard to guarantee. Deferred |
+| 2-way interleaving | Measured −14%. Removed |
+| Nsight Compute profiling | Abandoned for lack of permissions (requires administrator configuration) |

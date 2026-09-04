@@ -1,40 +1,45 @@
-# GPUonion
+# GPUonion: The FASTEST GPU-based Onion Address Vanity
 
-Tor v3 onion service の vanity アドレスを CUDA で探索するツール。
-[mkp224o](https://github.com/cathugger/mkp224o) /
-[onion-vanity-address](https://github.com/offset/onion-vanity-address) と同系統の
-スカラーインクリメント方式を GPU 上で実装したもの。
+A CUDA tool that searches for vanity addresses for Tor v3 onion services.
+It implements on the GPU the same scalar-increment approach used by
+[mkp224o](https://github.com/cathugger/mkp224o) and
+[onion-vanity-address](https://github.com/offset/onion-vanity-address).
 
-## アルゴリズム
+Up to 50 GKey/s @ 8x RTX 5090 ($3.5/hr on [vast.ai](https://cloud.vast.ai/?ref_id=314674)), which is 50x faster than 1.0 GKey/s @ 2x EPYC 128-Core Emb (512 threads) on mkp224o.
 
-- ランダムな clamped スカラー `a0` を起点に、スレッド `t` の第 `i` 候補を
-  `a = a0 + 8*(t + i*T)`（`T` = 総スレッド数）とする
-- GPU 上では Curve25519 (Montgomery) の x-only 差分加算 1 回（3M+2S）で
-  次候補へ進む（フルスカラー倍算は初期化時の1回のみ）。Edwards の y は
-  双有理写像 y = (U−W)/(U+W) から復元し、分母はバッチ逆元で償却
-- インクリメントを 8 の倍数に保つことで clamp 構造が維持され、結果はそのまま
-  Tor の expanded secret key (`hs_ed25519_secret_key`) として有効
-- 発見した鍵は必ず CPU 側で再計算・照合してから出力（GPU/CPU で同一の
-  `__host__ __device__` コードを共用）
+## Algorithm
 
-## ビルド
+- Starting from a random clamped scalar `a0`, the `i`-th candidate of thread `t` is
+  `a = a0 + 8*(t + i*T)` (`T` = total number of threads)
+- On the GPU, each step to the next candidate is a single Curve25519 (Montgomery)
+  x-only differential addition (3M+2S); the full scalar multiplication is done
+  only once, at initialization. The Edwards y is recovered through the
+  birational map y = (U−W)/(U+W), and the denominators are amortized with a
+  batch inversion
+- Keeping the increment a multiple of 8 preserves the clamp structure, so the
+  result is directly valid as a Tor expanded secret key (`hs_ed25519_secret_key`)
+- Every found key is recomputed and verified on the CPU before it is written
+  (the GPU and CPU share the same `__host__ __device__` code)
 
-### Linux (H100 などの本番環境)
+## Build
+
+### Linux (production environments such as H100)
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-デフォルトで sm_60〜sm_90 の実バイナリ + compute_90 の PTX を同梱するため、
-Pascal 以降のほぼ全 GPU（Blackwell 以降は JIT）で動作する。
-特定 GPU のみで良ければ高速にビルドできる:
+By default the binary bundles native code for sm_60 through sm_90 plus
+compute_90 PTX, so it runs on almost every GPU from Pascal onward
+(Blackwell and later via JIT). If you only need a specific GPU, the build is
+much faster:
 
 ```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90   # H100 のみ
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=90   # H100 only
 ```
 
-### Windows (開発環境)
+### Windows (development environment)
 
 VS 2022 + CUDA Toolkit 12.x:
 
@@ -43,60 +48,62 @@ cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-## 使い方
+## Usage
 
 ```bash
 ./gpuonion <prefix> [options]
 ./gpuonion -b [options]
-  <prefix>       探索する base32 プレフィックス (a-z 2-7)
-  -b, --bench    約20秒のベンチマークを実行（prefix不要）
-  -d <spec>      CUDA デバイス指定: "all"（デフォルト、全GPU使用）/ 単一番号 / "0,1,2" のようなカンマ区切り
-                 指定したGPUはそれぞれ独立したホストスレッドで並行して動作する
-  -n <count>     この個数見つけたら終了 (default 1)
-  -o <dir>       出力ディレクトリ (default ./found)
-  --blocks <n>   ブロック数 (default: SM数 * 16)
-  -t <threads>   ブロックあたりスレッド数 (default 128)
-  -i <iters>     1回の起動でスレッドあたり試行する候補数 (default 1024)
-  -B <batch>     Montgomery バッチ逆元のバッチサイズ、2べき 8..1024 (default 128)
-  --m51          5x51 limb 版カーネルを使用（A/B 比較用）
-  --ext          Edwards 拡張座標版カーネルを使用（A/B 比較用、最も遅い）
-  --selftest     内部テストのみ実行
+  <prefix>       base32 prefix to search for (a-z 2-7)
+  -b, --bench    run a ~20 second benchmark (no prefix needed)
+  -d <spec>      CUDA device selection: "all" (default, use every GPU) / a single index / a comma-separated list such as "0,1,2"
+                 each selected GPU runs concurrently on its own host thread
+  -n <count>     stop after finding this many keys (default 1)
+  -o <dir>       output directory (default ./found)
+  --blocks <n>   number of blocks (default: SM count * 16)
+  -t <threads>   threads per block (default 128)
+  -i <iters>     candidates tried per thread per launch (default 1024)
+  -B <batch>     batch size for the Montgomery batch inversion, power of two 8..1024 (default 128)
+  --m51          use the 5x51 limb kernel (for A/B comparison)
+  --ext          use the Edwards extended-coordinate kernel (for A/B comparison, slowest)
+  --selftest     run the internal tests only
 ```
 
-高速化の経緯と各手法の効果は [Optimize.md](Optimize.md) を参照。
+See [Optimize.md](Optimize.md) for the optimization history and the effect of each technique.
 
-例:
+Example:
 
 ```bash
 ./gpuonion claude
 ```
 
-ベンチマーク（マッチしない16文字prefixで実測し、prefix長ごとの期待所要時間も表示）:
+Benchmark (measures with a 16-character prefix that never matches, and also prints the expected time per prefix length):
 
 ```bash
 ./gpuonion -b
 ```
 
-出力は `found/<address>/` に Tor がそのまま読める形式で保存される:
+Output is saved under `found/<address>/` in a format Tor can read directly:
 
 - `hostname`
-- `hs_ed25519_secret_key`（`HiddenServiceDir` に配置して使用）
+- `hs_ed25519_secret_key` (place it in `HiddenServiceDir` to use it)
 - `hs_ed25519_public_key`
 
-## 性能の目安
+## Performance guide
 
-| GPU | 速度 |
+| GPU | Speed |
 |---|---|
-| RTX 4070 (sm_89) | ~2.7 GKey/s (持続) |
-| H100 (sm_90) | ~5-6 GKey/s (INT スループット比からの見積もり) |
+| RTX 4070 (sm_89) | ~2.7 GKey/s (sustained) |
+| H100 (sm_90) | ~5-6 GKey/s (estimated from the INT throughput ratio) |
 
-期待試行回数は `32^len`。RTX 4070 の実測では 6文字 prefix が平均 ~0.4 秒、
-7文字が ~13 秒、8文字が ~7 分、9文字が ~3.6 時間。
+The expected number of trials is `32^len`. Measured on an RTX 4070, a 6-character
+prefix takes ~0.4 s on average, 7 characters ~13 s, 8 characters ~7 min, and
+9 characters ~3.6 hours.
 
-実装は Montgomery x-only 差分加算 (3M+2S/候補) + バッチ逆元 +
-4×64bit limb の遅延簡約 (PTX madc 連鎖)。詳細は [Optimize.md](Optimize.md)。
+The implementation uses Montgomery x-only differential addition (3M+2S per
+candidate) + batch inversion + 4×64-bit limbs with lazy reduction (PTX madc
+chains). Details in [Optimize.md](Optimize.md).
 
-## 注意
+## Notes
 
-- prefix に使えるのは base32 文字 (`a-z`, `2-7`) のみ。`0 1 8 9` は不可
-- 秘密鍵ファイルの取り扱いに注意（`found/` はコミットしないこと）
+- Only base32 characters (`a-z`, `2-7`) are allowed in the prefix. `0 1 8 9` are not
+- Handle the secret key files with care (never commit `found/`)
