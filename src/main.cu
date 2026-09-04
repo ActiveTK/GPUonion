@@ -7,6 +7,12 @@
 //   so one curve addition + one field inversion per candidate.
 //   Keeping increments a multiple of 8 preserves the clamped shape of the scalar,
 //   so the result is a valid Tor "expanded" secret key (hs_ed25519_secret_key).
+//
+// Split-key mode (--split-pubkey): the search runs over A_c + a*B instead of
+//   a*B, where A_c is a requester's public key. The worker then only learns the
+//   offset a, and the requester forms the secret scalar (a_c + a) mod L
+//   themselves with --split-combine, so a GPU rented by a third party never
+//   sees the resulting secret key.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +68,12 @@ __device__ uint8_t c_target[MAX_PREFIXES][32];
 __device__ uint8_t c_mask[MAX_PREFIXES][32];
 __constant__ int c_mlen[MAX_PREFIXES];
 __constant__ ge25519 c_base; /* B */
+/* split-key mode: every thread's start point is offset by the requester's
+   public half A_c, so the candidates are A_c + a*B. Only the init kernels
+   look at it; the stepping kernels are unchanged, since adding a constant
+   point to the start does not change the step. */
+__constant__ int c_split;
+__constant__ ge25519 c_split_pt;
 /* step point S = (8*T)*B in cached affine form for mixed addition */
 __constant__ fe c_stepp;   /* Sy + Sx  */
 __constant__ fe c_stepm;   /* Sy - Sx  */
@@ -388,6 +400,8 @@ __global__ void k_init(ge25519* pts, uint32_t nthreads)
     fe_k2d(k2d);
     ge25519 P;
     ge_scalarmult(&P, sc, &c_base, k2d);
+    if (c_split)
+        ge_add(&P, &P, &c_split_pt, k2d);
     pts[t] = P;
 }
 
@@ -410,6 +424,8 @@ __global__ void k_init_mont(MontState* st, uint32_t nthreads)
     fe_k2d(k2d);
     ge25519 P, Pm;
     ge_scalarmult(&P, sc, &c_base, k2d);
+    if (c_split)
+        ge_add(&P, &P, &c_split_pt, k2d);
     ge_add(&Pm, &P, &c_stepneg, k2d);
 
     MontState s;
@@ -439,6 +455,8 @@ __global__ void k_init_mont4(MontState4* st, uint32_t nthreads)
     fe_k2d(k2d);
     ge25519 P, Pm;
     ge_scalarmult(&P, sc, &c_base, k2d);
+    if (c_split)
+        ge_add(&P, &P, &c_split_pt, k2d);
     ge_add(&Pm, &P, &c_stepneg, k2d);
 
     fe u, w;
@@ -860,13 +878,17 @@ static void result_scalar(uint8_t out[32], const uint8_t a0[32], uint32_t t, uin
     }
 }
 
-static void host_pubkey(uint8_t pk[32], const uint8_t scalar[32])
+/* pk = encode(scalar*B), or encode(split + scalar*B) when `split` is given
+   (split-key mode: the requester's public half) */
+static void host_pubkey(uint8_t pk[32], const uint8_t scalar[32], const ge25519* split = nullptr)
 {
     fe k2d;
     fe_k2d(k2d);
     ge25519 B, P;
     ge_basepoint(&B);
     ge_scalarmult(&P, scalar, &B, k2d);
+    if (split)
+        ge_add(&P, &P, split, k2d);
     ge_tobytes(pk, &P);
 }
 
@@ -879,8 +901,12 @@ static bool write_file(const std::filesystem::path& p, const void* data, size_t 
     return f.good();
 }
 
+/* `nonce` (32 bytes) fills the second half of the expanded secret key; random
+   when null. --split-combine passes the requester's own so the secret half
+   file and the final key agree byte for byte apart from the scalar. */
 static bool save_result(const std::string& outdir, const std::string& addr,
-                        const uint8_t scalar[32], const uint8_t pubkey[32])
+                        const uint8_t scalar[32], const uint8_t pubkey[32],
+                        const uint8_t* nonce = nullptr)
 {
     namespace fs = std::filesystem;
     fs::path dir = fs::path(outdir) / addr.substr(0, addr.find('.'));
@@ -896,7 +922,10 @@ static bool save_result(const std::string& outdir, const std::string& addr,
     memset(sec, 0, sizeof(sec));
     memcpy(sec, "== ed25519v1-secret: type0 ==", 29);
     memcpy(sec + 32, scalar, 32);
-    os_random(sec + 64, 32);
+    if (nonce)
+        memcpy(sec + 64, nonce, 32);
+    else
+        os_random(sec + 64, 32);
 
     uint8_t pub[32 + 32];
     memset(pub, 0, sizeof(pub));
@@ -984,6 +1013,263 @@ static void upload_key(const std::string& outdir, const std::string& addr)
     namespace fs = std::filesystem;
     fs::path secpath = fs::path(outdir) / addr.substr(0, addr.find('.')) / "hs_ed25519_secret_key";
     curl_upload(secpath, addr + ".key");
+}
+
+/* ---------------- split-key ----------------
+   Lets a GPU owner search on someone else's behalf without ever holding the
+   resulting secret key. The requester keeps a random scalar a_c (the "secret
+   half", stored in Tor's own hs_ed25519_secret_key format so it needs no new
+   parser) and hands out only A_c = a_c*B (the "public half"). The worker
+   searches an offset k such that A_c + k*B encodes to the wanted address and
+   returns k. Since a_c*B + k*B = (a_c + k)*B, the requester alone can form the
+   final secret scalar a = (a_c + k) mod L. Tor reduces the scalar mod L before
+   use (its own key blinding produces such unclamped scalars), so the sum is a
+   valid expanded secret key as is. The offset is public information: with A_c
+   it yields only the final public key, which the address already reveals. */
+
+/* group order L = 2^252 + 27742317777372353535851937790883648493, little-endian */
+static const uint8_t SC_L[32] = {
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+    0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
+};
+
+/* out = (a + b) mod L for 32-byte little-endian a, b. The sum is below
+   2^256 < 16*L, so a handful of conditional subtractions fully reduces it. */
+static void sc_add_mod_l(uint8_t out[32], const uint8_t a[32], const uint8_t b[32])
+{
+    uint8_t s[33];
+    uint32_t c = 0;
+    for (int i = 0; i < 32; i++) {
+        uint32_t v = (uint32_t)a[i] + b[i] + c;
+        s[i] = (uint8_t)v;
+        c = v >> 8;
+    }
+    s[32] = (uint8_t)c;
+    for (;;) {
+        bool ge = true; /* s >= L ? */
+        for (int i = 32; i >= 0; i--) {
+            uint8_t li = i < 32 ? SC_L[i] : 0;
+            if (s[i] != li) {
+                ge = s[i] > li;
+                break;
+            }
+        }
+        if (!ge)
+            break;
+        int32_t borrow = 0;
+        for (int i = 0; i < 33; i++) {
+            int32_t v = (int32_t)s[i] - (i < 32 ? SC_L[i] : 0) - borrow;
+            borrow = v < 0;
+            s[i] = (uint8_t)(v & 0xff);
+        }
+    }
+    memcpy(out, s, 32);
+}
+
+static bool parse_hex32(const std::string& s, uint8_t out[32])
+{
+    if (s.size() != 64)
+        return false;
+    for (int i = 0; i < 32; i++) {
+        unsigned v = 0;
+        for (int j = 0; j < 2; j++) {
+            char ch = s[2 * i + j];
+            v <<= 4;
+            if (ch >= '0' && ch <= '9') v |= (unsigned)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') v |= (unsigned)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') v |= (unsigned)(ch - 'A' + 10);
+            else return false;
+        }
+        out[i] = (uint8_t)v;
+    }
+    return true;
+}
+
+/* `arg` is either 64 hex characters or the path of a text file whose first
+   whitespace-delimited token is (the split_public_half / split_offset files
+   this tool writes). Prints an error and returns false otherwise. */
+static bool load_hex32_arg(const std::string& arg, const char* what, uint8_t out[32])
+{
+    if (parse_hex32(arg, out))
+        return true;
+    std::ifstream f(arg);
+    std::string tok;
+    if (!f || !(f >> tok)) {
+        fprintf(stderr, "%s: '%s' is neither 64 hex characters nor a readable file\n", what,
+                arg.c_str());
+        return false;
+    }
+    if (!parse_hex32(tok, out)) {
+        fprintf(stderr, "%s: file '%s' does not start with 64 hex characters\n", what,
+                arg.c_str());
+        return false;
+    }
+    return true;
+}
+
+/* L*P == identity, i.e. P is in the prime-order subgroup. A public half with
+   a torsion component would make the worker's A_c + k*B differ from
+   (a_c + k)*B, so the search would find an address no scalar can reproduce. */
+static bool ge_is_prime_order(const ge25519* P, const fe k2d)
+{
+    ge25519 Q;
+    ge_scalarmult(&Q, SC_L, P, k2d);
+    uint8_t enc[32], ident[32];
+    ge_tobytes(enc, &Q);
+    memset(ident, 0, 32);
+    ident[0] = 1; /* identity (0, 1) encodes as y = 1, sign 0 */
+    return memcmp(enc, ident, 32) == 0;
+}
+
+/* Worker-side output for a split-key match. There is no secret key to write:
+   the offset, the requester's public half it belongs to, the public key and
+   the hostname are everything the worker knows. */
+static bool save_split_result(const std::string& outdir, const std::string& addr,
+                              const uint8_t offset[32], const uint8_t pubkey[32],
+                              const uint8_t split_pk[32])
+{
+    namespace fs = std::filesystem;
+    fs::path dir = fs::path(outdir) / addr.substr(0, addr.find('.'));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        fprintf(stderr, "failed to create %s\n", dir.string().c_str());
+        return false;
+    }
+    uint8_t pub[32 + 32];
+    memset(pub, 0, sizeof(pub));
+    memcpy(pub, "== ed25519v1-public: type0 ==", 29);
+    memcpy(pub + 32, pubkey, 32);
+
+    std::string hostname = addr + "\n";
+    std::string off = hex(offset, 32) + "\n";
+    std::string half = hex(split_pk, 32) + "\n";
+    bool ok = write_file(dir / "split_offset", off.data(), off.size()) &&
+              write_file(dir / "split_public_half", half.data(), half.size()) &&
+              write_file(dir / "hs_ed25519_public_key", pub, sizeof(pub)) &&
+              write_file(dir / "hostname", hostname.data(), hostname.size());
+    if (ok)
+        printf("  saved to %s\n", dir.string().c_str());
+    return ok;
+}
+
+static void upload_offset(const std::string& outdir, const std::string& addr)
+{
+    namespace fs = std::filesystem;
+    fs::path p = fs::path(outdir) / addr.substr(0, addr.find('.')) / "split_offset";
+    curl_upload(p, addr + ".offset");
+}
+
+/* --split-keygen <dir>: the requester's step 1. Writes the secret half (a
+   random clamped scalar plus nonce, in hs_ed25519_secret_key format) and the
+   matching public half as hex, and prints the latter, which is the only
+   thing that goes to the worker. */
+static int split_keygen(const std::string& dir)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        fprintf(stderr, "failed to create %s\n", dir.c_str());
+        return 1;
+    }
+    fs::path secpath = fs::path(dir) / "split_secret_half";
+    if (fs::exists(secpath)) {
+        fprintf(stderr, "%s already exists; refusing to overwrite a secret half\n",
+                secpath.string().c_str());
+        return 1;
+    }
+
+    uint8_t a[32], nonce[32], pk[32];
+    os_random(a, 32);
+    a[0] &= 0xF8;
+    a[31] = (uint8_t)((a[31] & 0x3F) | 0x40);
+    os_random(nonce, 32);
+    host_pubkey(pk, a);
+
+    uint8_t sec[32 + 64];
+    memset(sec, 0, sizeof(sec));
+    memcpy(sec, "== ed25519v1-secret: type0 ==", 29);
+    memcpy(sec + 32, a, 32);
+    memcpy(sec + 64, nonce, 32);
+    std::string half = hex(pk, 32) + "\n";
+    if (!write_file(secpath, sec, sizeof(sec)) ||
+        !write_file(fs::path(dir) / "split_public_half", half.data(), half.size())) {
+        fprintf(stderr, "failed to write into %s\n", dir.c_str());
+        return 1;
+    }
+    printf("split-key secret half : %s  (keep private; needed by --split-combine)\n",
+           secpath.string().c_str());
+    printf("split-key public half : %s\n", hex(pk, 32).c_str());
+    printf("give the public half to the worker:\n  gpuonion <prefix> --split-pubkey %s\n",
+           hex(pk, 32).c_str());
+    return 0;
+}
+
+/* --split-combine <secret half> <offset>: the requester's step 3. Forms
+   a = (a_c + k) mod L, recomputes the public key and address from it,
+   double-checks against A_c + k*B, and writes a ready-to-use Tor key
+   directory. `offset` is hex or the worker's split_offset file; when it is
+   a file next to a hostname file, the address is checked against that too. */
+static int split_combine(const std::string& secret_path, const std::string& offset_arg,
+                         const std::string& outdir)
+{
+    namespace fs = std::filesystem;
+    std::ifstream f(secret_path, std::ios::binary);
+    uint8_t sec[96];
+    if (!f || !f.read((char*)sec, sizeof(sec)) ||
+        memcmp(sec, "== ed25519v1-secret: type0 ==", 29) != 0) {
+        fprintf(stderr, "'%s' is not a split secret half / hs_ed25519_secret_key file\n",
+                secret_path.c_str());
+        return 1;
+    }
+    const uint8_t* a_c = sec + 32;
+    const uint8_t* nonce = sec + 64;
+
+    uint8_t k[32];
+    if (!load_hex32_arg(offset_arg, "offset", k))
+        return 1;
+
+    uint8_t a[32], pk[32], pk2[32];
+    sc_add_mod_l(a, a_c, k);
+    host_pubkey(pk, a);
+    {
+        fe k2d;
+        fe_k2d(k2d);
+        ge25519 B, Ac, K, S;
+        ge_basepoint(&B);
+        ge_scalarmult(&Ac, a_c, &B, k2d);
+        ge_scalarmult(&K, k, &B, k2d);
+        ge_add(&S, &Ac, &K, k2d);
+        ge_tobytes(pk2, &S);
+    }
+    if (memcmp(pk, pk2, 32) != 0) {
+        fprintf(stderr, "internal error: (a_c + k) mod L does not reproduce A_c + k*B\n");
+        return 1;
+    }
+    std::string addr = onion_address(pk);
+
+    /* if the offset came from a worker output directory, cross-check its hostname */
+    if (!parse_hex32(offset_arg, pk2)) {
+        fs::path hn = fs::path(offset_arg).parent_path() / "hostname";
+        std::ifstream hf(hn);
+        std::string expect;
+        if (hf && (hf >> expect) && expect != addr) {
+            fprintf(stderr,
+                    "address mismatch: this secret half + offset gives %s but %s says %s\n"
+                    "(wrong secret half for this offset?)\n",
+                    addr.c_str(), hn.string().c_str(), expect.c_str());
+            return 1;
+        }
+    }
+
+    printf("address: %s\n", addr.c_str());
+    if (!save_result(outdir, addr, a, pk, nonce))
+        return 1;
+    printf("hs_ed25519_secret_key written; copy the directory contents into HiddenServiceDir\n");
+    return 0;
 }
 
 /* Renders a plain-text progress snapshot: elapsed time, combined key rate,
@@ -1156,6 +1442,96 @@ static bool selftest()
         return false;
     }
 
+    /* 4b. split-key building blocks: sqrt(-1), point decompression, the
+       group order, and the homomorphism the whole scheme rests on:
+       decompress(a_c*B) + k*B == ((a_c + k) mod L)*B, with a sum that
+       overflows L so the reduction is exercised */
+    {
+        fe sm1, one;
+        fe_sqrtm1(sm1);
+        fe_sq(sm1, sm1);
+        fe_1(one);
+        fe_add(sm1, sm1, one);
+        if (!fe_iszero(sm1)) {
+            fprintf(stderr, "selftest FAIL: sqrt(-1)^2 != -1\n");
+            return false;
+        }
+        ge25519 Bd;
+        uint8_t rt[32];
+        if (!ge_frombytes(&Bd, expect)) {
+            fprintf(stderr, "selftest FAIL: basepoint does not decompress\n");
+            return false;
+        }
+        ge_tobytes(rt, &Bd);
+        if (memcmp(rt, expect, 32) != 0) {
+            fprintf(stderr, "selftest FAIL: basepoint decompress round trip\n");
+            return false;
+        }
+        if (!ge_is_prime_order(&B, k2d)) {
+            fprintf(stderr, "selftest FAIL: L*B != identity\n");
+            return false;
+        }
+        const uint8_t scal[2][32] = {
+            { 0x3c, 0x91, 0xe2, 0x07, 0x55, 0xaa, 0x10, 0x8f, 0x00, 0xd4, 0x1b, 0x66, 0x29, 0xf3, 0x71, 0x0e,
+              0x83, 0x5d, 0xc0, 0x12, 0x9a, 0x4e, 0xb7, 0x3f, 0x6d, 0x02, 0xc8, 0x41, 0xa5, 0x0b, 0xf9, 0x7f },
+            { 0xa8, 0x14, 0x7b, 0x9e, 0x03, 0xd6, 0xc2, 0x5f, 0xe1, 0x38, 0x4a, 0x90, 0x6c, 0x17, 0xbb, 0x02,
+              0x5e, 0xf4, 0x21, 0x8d, 0x39, 0xc7, 0x0a, 0x66, 0xd1, 0xe8, 0x73, 0x2c, 0x94, 0x1f, 0x60, 0x7f }
+        };
+        for (int i = 0; i < 2; i++) {
+            const uint8_t* ac = scal[i];
+            const uint8_t* kk = scal[1 - i];
+            ge25519 PA, PAd, PK, S1, S2;
+            uint8_t enc[32], sum[32], e1[32], e2[32];
+            ge_scalarmult(&PA, ac, &B, k2d);
+            ge_tobytes(enc, &PA);
+            if (!ge_frombytes(&PAd, enc)) {
+                fprintf(stderr, "selftest FAIL: decompress a_c*B\n");
+                return false;
+            }
+            ge_tobytes(e1, &PAd);
+            if (memcmp(e1, enc, 32) != 0) {
+                fprintf(stderr, "selftest FAIL: decompress round trip (sign %d)\n", enc[31] >> 7);
+                return false;
+            }
+            ge_scalarmult(&PK, kk, &B, k2d);
+            ge_add(&S1, &PAd, &PK, k2d);
+            ge_tobytes(e1, &S1);
+            sc_add_mod_l(sum, ac, kk);
+            if (sum[31] & 0xE0) {
+                fprintf(stderr, "selftest FAIL: sc_add_mod_l not reduced\n");
+                return false;
+            }
+            ge_scalarmult(&S2, sum, &B, k2d);
+            ge_tobytes(e2, &S2);
+            if (memcmp(e1, e2, 32) != 0) {
+                fprintf(stderr, "selftest FAIL: split-key homomorphism\n");
+                return false;
+            }
+        }
+        /* about half of all y values are not on the curve: over a run of
+           small y, every accepted one must round-trip and some must be
+           rejected */
+        int rejected = 0;
+        for (int yv = 2; yv < 18; yv++) {
+            uint8_t enc[32], rt2[32];
+            memset(enc, 0, 32);
+            enc[0] = (uint8_t)yv;
+            if (!ge_frombytes(&Bd, enc)) {
+                rejected++;
+                continue;
+            }
+            ge_tobytes(rt2, &Bd);
+            if (memcmp(rt2, enc, 32) != 0) {
+                fprintf(stderr, "selftest FAIL: decompress round trip y=%d\n", yv);
+                return false;
+            }
+        }
+        if (rejected == 0) {
+            fprintf(stderr, "selftest FAIL: decompress never rejects a non-point\n");
+            return false;
+        }
+    }
+
     /* 5. known onion address derivation sanity: 56 chars + .onion */
     std::string addr = onion_address(pk);
     if (addr.size() != 62 || addr.substr(56) != ".onion") {
@@ -1192,6 +1568,11 @@ struct RunConfig {
     double bench_secs;
     bool keep_forever; /* --keep-working-until-ctrlc: never stop on match count */
     bool upload_status; /* --upload-status-per-30min: periodic progress snapshot */
+    /* --split-pubkey: search A_c + a*B and report a (the offset) instead of
+       the scalar itself; split_pt is A_c decompressed, split_pk its encoding */
+    bool split;
+    ge25519 split_pt;
+    uint8_t split_pk[32];
     /* --use-wordlist-ab-with-normal-list. target_len == 0 means the mode is
        off, in which case ftinfo is all zero and the device skips stage 2. */
     int target_len;
@@ -1503,6 +1884,13 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                                       sizeof(uint64_t) * cfg.wordkey.size()));
     }
     CUDA_CHECK(cudaMemcpyToSymbol(c_base, &hostB, sizeof(ge25519)));
+    {
+        int split_flag = cfg.split ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyToSymbol(c_split, &split_flag, sizeof(int)));
+        if (cfg.split)
+            CUDA_CHECK(cudaMemcpyToSymbol(c_split_pt, &cfg.split_pt, sizeof(ge25519)));
+    }
+    const ge25519* split_pt = cfg.split ? &cfg.split_pt : nullptr;
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepp, stepp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepm, stepm, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_step2dt, step2dt, sizeof(fe)));
@@ -1544,7 +1932,7 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     for (uint32_t t = 0; t < 3; t++) {
         uint8_t sc[32], hpk[32], gy[32];
         result_scalar(sc, a0, t, 0, T);
-        host_pubkey(hpk, sc);
+        host_pubkey(hpk, sc, split_pt);
         if (mode == 2) {
             ge25519 chk;
             CUDA_CHECK(cudaMemcpy(&chk, (ge25519*)d_state + t, sizeof(chk),
@@ -1657,7 +2045,7 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
             for (uint32_t r = 0; r < nn && (cfg.keep_forever || global_found.load() < cfg.want); r++) {
                 uint8_t sc[32], pk[32];
                 result_scalar(sc, a0, recs[r].tid, recs[r].iter, T);
-                host_pubkey(pk, sc);
+                host_pubkey(pk, sc, split_pt);
                 std::string addr = onion_address(pk);
                 /* rebuild the full pattern: in wordlist mode cfg.prefixes[]
                    holds only the first word and the device reports which word
@@ -1680,9 +2068,17 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                     std::lock_guard<std::mutex> lk(out_mtx);
                     printf("\nFOUND (%.1fs, %llu keys total): %s\n", el,
                            (unsigned long long)g_total_keys.load(), addr.c_str());
-                    printf("  secret scalar: %s\n", hex(sc, 32).c_str());
-                    if (save_result(cfg.outdir, addr, sc, pk))
-                        upload_key(cfg.outdir, addr);
+                    if (cfg.split) {
+                        printf("  offset scalar: %s\n", hex(sc, 32).c_str());
+                        printf("  (no secret key here: the requester combines this offset with"
+                               " their secret half via --split-combine)\n");
+                        if (save_split_result(cfg.outdir, addr, sc, pk, cfg.split_pk))
+                            upload_offset(cfg.outdir, addr);
+                    } else {
+                        printf("  secret scalar: %s\n", hex(sc, 32).c_str());
+                        if (save_result(cfg.outdir, addr, sc, pk))
+                            upload_key(cfg.outdir, addr);
+                    }
                     g_found_addrs.push_back(addr);
                 }
                 global_found.fetch_add(1);
@@ -1745,6 +2141,23 @@ static void usage(const char* argv0)
             "                 warp into the pattern scan, so a few short words can\n"
             "                 halve throughput; raising this drops those pairs but\n"
             "                 buys most of the speed back. Default 5.\n"
+            "  --split-pubkey <hex|file>\n"
+            "                 split-key search: <hex> is a requester's 32-byte ed25519\n"
+            "                 public key (their \"public half\", from --split-keygen), or\n"
+            "                 a file holding it. Candidates are then A_c + a*B and a\n"
+            "                 match writes split_offset (a, hex) instead of a secret\n"
+            "                 key - this machine never learns the resulting private\n"
+            "                 key. The requester turns the offset into the Tor key\n"
+            "                 with --split-combine. Works with every other option.\n"
+            "  --split-keygen <dir>\n"
+            "                 (requester, step 1; no GPU needed) write a fresh secret\n"
+            "                 half to <dir>/split_secret_half and its public half to\n"
+            "                 <dir>/split_public_half, then print the public half\n"
+            "  --split-combine <secret-half-file> <offset hex|file>\n"
+            "                 (requester, step 3; no GPU needed) add the worker's\n"
+            "                 offset to the secret half mod L and write the final\n"
+            "                 hostname / hs_ed25519_public_key / hs_ed25519_secret_key\n"
+            "                 under -o <dir>/<address>/\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
             "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
             "                 a single index, or a comma list e.g. \"0,1,2\".\n"
@@ -1803,9 +2216,18 @@ int main(int argc, char** argv)
     bool keep_forever = false;
     bool upload_status = false;
     const double bench_secs = 20.0;
+    std::string split_pub_arg;    /* --split-pubkey: requester's public half, hex or file */
+    std::string split_keygen_dir; /* --split-keygen <dir> */
+    std::string split_secret_path, split_offset_arg; /* --split-combine <secret half> <offset> */
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--selftest")) selftest_only = true;
+        else if (!strcmp(argv[i], "--split-pubkey") && i + 1 < argc) split_pub_arg = argv[++i];
+        else if (!strcmp(argv[i], "--split-keygen") && i + 1 < argc) split_keygen_dir = argv[++i];
+        else if (!strcmp(argv[i], "--split-combine") && i + 2 < argc) {
+            split_secret_path = argv[++i];
+            split_offset_arg = argv[++i];
+        }
         else if (!strcmp(argv[i], "-b") || !strcmp(argv[i], "--bench")) benchmark = true;
         else if (!strcmp(argv[i], "-d") && i + 1 < argc) device_arg = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
@@ -1842,6 +2264,11 @@ int main(int argc, char** argv)
         printf("selftest OK\n");
         return 0;
     }
+    /* requester-side split-key steps: pure host arithmetic, no GPU involved */
+    if (!split_keygen_dir.empty())
+        return split_keygen(split_keygen_dir);
+    if (!split_secret_path.empty())
+        return split_combine(split_secret_path, split_offset_arg, outdir);
     if (prefix_args.empty() && prefix_file.empty() && wl_path_a.empty() && !benchmark) {
         usage(argv[0]);
         return 1;
@@ -2039,6 +2466,35 @@ int main(int argc, char** argv)
         cfg.prefixes.push_back(pfx);
     }
 
+    /* --split-pubkey: decompress the requester's public half once on the host
+       and refuse anything that is not a prime-order point, since a torsion
+       component would make every found offset unusable */
+    cfg.split = !split_pub_arg.empty();
+    if (cfg.split) {
+        if (!load_hex32_arg(split_pub_arg, "--split-pubkey", cfg.split_pk))
+            return 1;
+        fe k2d;
+        fe_k2d(k2d);
+        if (!ge_frombytes(&cfg.split_pt, cfg.split_pk)) {
+            fprintf(stderr, "--split-pubkey: %s is not a point on the curve\n",
+                    hex(cfg.split_pk, 32).c_str());
+            return 1;
+        }
+        if (!ge_is_prime_order(&cfg.split_pt, k2d)) {
+            fprintf(stderr, "--split-pubkey: %s is not in the prime-order subgroup"
+                    " (not a key of the form a*B)\n", hex(cfg.split_pk, 32).c_str());
+            return 1;
+        }
+        uint8_t ident[32];
+        memset(ident, 0, 32);
+        ident[0] = 1;
+        if (memcmp(cfg.split_pk, ident, 32) == 0) {
+            fprintf(stderr, "--split-pubkey: the identity point means a secret half of zero;"
+                    " the offset alone would be the whole key\n");
+            return 1;
+        }
+    }
+
     if (batch != 8 && batch != 16 && batch != 32 && batch != 64 && batch != 128 &&
         batch != 256 && batch != 512 && batch != 1024) {
         fprintf(stderr, "batch size must be a power of two in 8..1024\n");
@@ -2192,6 +2648,11 @@ int main(int argc, char** argv)
                     printf("            %s\n", s.c_str());
             }
         }
+
+        if (cfg.split)
+            printf("split   : public half %s\n"
+                   "          (matches are offsets; the requester finishes with --split-combine)\n",
+                   hex(cfg.split_pk, 32).c_str());
 
         if (banner_plan.use_bloom) {
             printf("filter  : keys on ");

@@ -5,7 +5,7 @@ It implements on the GPU the same scalar-increment approach used by
 [mkp224o](https://github.com/cathugger/mkp224o) and
 [onion-vanity-address](https://github.com/offset/onion-vanity-address).
 
-Up to 50 GKey/s @ 8x RTX 5090 ($3.5/hr on [vast.ai](https://cloud.vast.ai/?ref_id=314674)), which is 50x faster than 1.0 GKey/s @ 2x EPYC 128-Core Emb (512 threads) on mkp224o.
+Up to 50 GKey/s @ 8x RTX 5090 ($3.5/hr on [vast.ai](https://cloud.vast.ai/?ref_id=314674)), which is 50x faster than 1.0 GKey/s @ 2x EPYC 128-Core Emb (512 threads) and 500,000x faster than 100 Kkeys/s @ i5 3320M (My ThinkPad, 4 threads) on mkp224o.
 
 | Length | Expected trials | Average time | Cost ($3.5/h) |
 |---|---|---|---|
@@ -77,6 +77,9 @@ cmake --build build --config Release
 ./gpuonion -b [options]
   <prefix>       base32 prefix to search for (a-z 2-7)
   -b, --bench    run a ~20 second benchmark (no prefix needed)
+  --split-pubkey <hex|file>          split-key search for someone else's key (see below)
+  --split-keygen <dir>               requester: create secret/public half
+  --split-combine <secret-half> <offset>   requester: build the final Tor key
   -d <spec>      CUDA device selection: "all" (default, use every GPU) / a single index / a comma-separated list such as "0,1,2"
                  each selected GPU runs concurrently on its own host thread
   -n <count>     stop after finding this many keys (default 1)
@@ -110,6 +113,54 @@ Output is saved under `found/<address>/` in a format Tor can read directly:
 - `hostname`
 - `hs_ed25519_secret_key` (place it in `HiddenServiceDir` to use it)
 - `hs_ed25519_public_key`
+
+## Split-key (have someone else's GPU search without giving them your key)
+
+Renting a fleet of GPUs means the machine that finds the key is not yours. In
+split-key mode the GPU never sees the secret key at all. The requester keeps a
+random scalar `a_c` (the **secret half**) and hands out only `A_c = a_c*B` (the
+**public half**). The worker searches for an offset `k` such that `A_c + k*B`
+gives the wanted address and returns `k`. Since `a_c*B + k*B = (a_c + k)*B`,
+only the requester can form the final secret scalar `a = (a_c + k) mod L`.
+The offset is not sensitive: with the public half it yields only the public key,
+which the address already reveals.
+
+Step 1, requester (any machine, no GPU needed):
+
+```bash
+./gpuonion --split-keygen mykey
+#  mykey/split_secret_half   <- keep private (Tor hs_ed25519_secret_key format)
+#  mykey/split_public_half   <- 64 hex chars; this is all the worker gets
+```
+
+Step 2, worker (GPU; every other option works as usual):
+
+```bash
+./gpuonion activetk --split-pubkey <public half hex, or path to split_public_half>
+#  found/<address>/split_offset           <- the offset k (hex), sent back to the requester
+#  found/<address>/split_public_half      <- which public half it belongs to
+#  found/<address>/hostname, hs_ed25519_public_key
+```
+
+There is no `hs_ed25519_secret_key` on the worker, and none can be derived
+there. The offset file is what gets uploaded in place of the key (or kept
+local with `--no-upload`).
+
+Step 3, requester:
+
+```bash
+./gpuonion --split-combine mykey/split_secret_half <offset hex, or path to split_offset>
+#  found/<address>/hostname
+#  found/<address>/hs_ed25519_public_key
+#  found/<address>/hs_ed25519_secret_key   <- ready for HiddenServiceDir
+```
+
+The combine step recomputes the address from `(a_c + k) mod L`, checks it
+against `A_c + k*B`, and, when the offset is given as a file, against the
+`hostname` next to it, so a wrong secret half is caught rather than written.
+Tor reduces expanded secret scalars mod L before use (its own key blinding
+produces such scalars), so the unclamped sum is a valid key as is. The search
+speed is identical to normal mode: only the per-thread start point changes.
 
 ## Notes
 
