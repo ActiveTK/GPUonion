@@ -7,6 +7,23 @@ It implements on the GPU the same scalar-increment approach used by
 
 Up to 50 GKey/s @ 8x RTX 5090 ($3.5/hr on [vast.ai](https://cloud.vast.ai/?ref_id=314674)), which is 50x faster than 1.0 GKey/s @ 2x EPYC 128-Core Emb (512 threads) on mkp224o.
 
+| Length | Expected trials | Average time | Cost ($3.5/h) |
+|---|---|---|---|
+| 1 | 32 | instant | ≈ $0 |
+| 2 | 1,024 | instant | ≈ $0 |
+| 3 | 32,768 | instant | ≈ $0 |
+| 4 | ~1.05×10⁶ | instant | ≈ $0 |
+| 5 | ~3.36×10⁷ | instant | ≈ $0 |
+| 6 | ~1.07×10⁹ | 21 ms | ≈ $0 |
+| 7 | ~3.44×10¹⁰ | 0.69 s | $0.0007 |
+| 8 | ~1.10×10¹² | 22 s | $0.02 |
+| 9 | ~3.52×10¹³ | 11.7 min | $0.68 |
+| 10 | ~1.13×10¹⁵ | 6.3 hours | $22 |
+| 11 | ~3.60×10¹⁶ | 8.3 days | $700 |
+| 12 | ~1.15×10¹⁸ | 267 days (0.73 yr) | $22,400 |
+| 13 | ~3.69×10¹⁹ | 23.4 years | $717,000 |
+| 14 | ~1.18×10²¹ | 748 years | $23 million |
+
 ## Algorithm
 
 - Starting from a random clamped scalar `a0`, the `i`-th candidate of thread `t` is
