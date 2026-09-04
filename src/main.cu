@@ -1737,6 +1737,14 @@ static void usage(const char* argv0)
             "                 <normal-list> is read exactly like --prefix-from-file\n"
             "                 and searched alongside. Constraint: the merged word\n"
             "                 list plus the normal list is at most %d entries.\n"
+            "  --min-first-len <n>\n"
+            "                 in wordlist-AB mode, words shorter than <n> chars are\n"
+            "                 never used as the first half of a pair (they stay\n"
+            "                 usable as the second half). A short first word clears\n"
+            "                 the prefilter ~32^-len of the time and drags its whole\n"
+            "                 warp into the pattern scan, so a few short words can\n"
+            "                 halve throughput; raising this drops those pairs but\n"
+            "                 buys most of the speed back. Default 5.\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
             "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
             "                 a single index, or a comma list e.g. \"0,1,2\".\n"
@@ -1778,6 +1786,12 @@ int main(int argc, char** argv)
     /* --use-wordlist-ab-with-normal-list <A> <B> <target len> <normal list> */
     std::string wl_path_a, wl_path_b, wl_normal_path;
     int wl_target_len = 0;
+    /* Words shorter than this never become a first-half device pattern (they
+       stay usable as tails). A short first word is keyed on only its own few
+       characters, so it clears the prefilter ~32^-len of the time and drags
+       its whole warp into the pattern scan; excluding it costs a slice of the
+       pair space but buys most of the throughput back. Default 5. */
+    int wl_min_first_len = 5;
     std::string device_arg = "all"; /* single index, comma list ("0,1"), or "all" (default) */
     int tpb = 0, blocks = 0, batch = 512;
     uint32_t iters = 1024;
@@ -1812,6 +1826,7 @@ int main(int argc, char** argv)
             wl_target_len = atoi(argv[++i]);
             wl_normal_path = argv[++i];
         }
+        else if (!strcmp(argv[i], "--min-first-len") && i + 1 < argc) wl_min_first_len = atoi(argv[++i]);
         else if (argv[i][0] != '-') prefix_args.push_back(argv[i]);
         else {
             usage(argv[0]);
@@ -1929,7 +1944,9 @@ int main(int argc, char** argv)
             raw_prefixes.push_back(nl);
         raw_ftinfo.assign(raw_prefixes.size(), 0);
 
-        int nfirst = 0;
+        if (wl_min_first_len < 1)
+            wl_min_first_len = 1;
+        int nfirst = 0, nshort_skipped = 0;
         for (size_t i = 0; i < wl_words.size(); i++) {
             /* a word from A needs a partner from B and vice versa */
             uint32_t need = ((wl_memb[i] & WORD_IN_A) ? WORD_IN_B : 0u) |
@@ -1937,15 +1954,28 @@ int main(int argc, char** argv)
             int comp = wl_target_len - (int)wl_words[i].size();
             if (comp < 1 || comp > MAX_WORD_LEN || wl_cnt_memb[comp][need] == 0)
                 continue; /* no legal partner of the complementary length */
+            /* too short to lead: keep it in the tail table (built above from
+               every word) but do not give it a device pattern, so the pairs
+               where it comes second are still searched and only the ones where
+               it comes first are dropped */
+            if ((int)wl_words[i].size() < wl_min_first_len) {
+                nshort_skipped++;
+                continue;
+            }
             raw_prefixes.push_back(wl_words[i]);
             raw_ftinfo.push_back((uint8_t)(wl_words[i].size() | (need << 5)));
             nfirst++;
         }
         if (nfirst == 0) {
-            fprintf(stderr, "no word of '%s' pairs with a word of '%s' to make %d characters\n",
-                    wl_path_a.c_str(), wl_path_b.c_str(), wl_target_len);
+            fprintf(stderr,
+                    "no word of '%s' pairs with a word of '%s' to make %d characters"
+                    " with --min-first-len %d\n",
+                    wl_path_a.c_str(), wl_path_b.c_str(), wl_target_len, wl_min_first_len);
             return 1;
         }
+        if (nshort_skipped > 0)
+            printf("min-first: %d word%s under %d chars kept as tails only (not as first half)\n",
+                   nshort_skipped, nshort_skipped == 1 ? "" : "s", wl_min_first_len);
     }
 
     /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
