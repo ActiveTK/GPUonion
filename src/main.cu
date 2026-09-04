@@ -12,6 +12,8 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <set>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -96,6 +98,26 @@ __constant__ uint64_t c_bloom_mask;
 __constant__ uint32_t c_use_bloom;
 __device__ uint32_t g_bloom[BLOOM_WORDS];
 
+/* ---- --use-wordlist-with-normal-list: two-stage (word1 | word2) match ----
+   A prefix set built by concatenating two words is a product set A x B, so
+   the hot path never has to know about more than A. c_ftlen[p] is 0 for an
+   ordinary prefix pattern (a match there is final) and otherwise the
+   character length of the first word that pattern stands for. Such a pattern
+   firing only clears stage 1: the characters following the word must then
+   themselves be a word of length c_target_len - c_ftlen[p], which stage 2
+   looks up in the length bucket [c_wl_start[l], c_wl_end[l]) of the word
+   table. Every per-candidate cost therefore scales with |A| while the
+   effective pattern count is |A|*|B| - far past MAX_PREFIXES. */
+#define MAX_WORD_LEN 30
+__constant__ int c_target_len; /* 0 when the mode is off */
+__constant__ uint8_t c_ftlen[MAX_PREFIXES];
+__constant__ int c_wl_start[32];
+__constant__ int c_wl_end[32];
+/* words as base32 character values (0..31), grouped by length. Global rather
+   than __constant__ for the same reason as c_target/c_mask: only stage 2
+   reads it, and stage 2 runs at the stage-1 rate (~1e-6), not per candidate. */
+__device__ uint8_t g_wordchars[MAX_PREFIXES][MAX_WORD_LEN];
+
 /* Montgomery x-only stepping: u(S)+1, u(S)-1, and -S (Edwards ext.) for init */
 __constant__ fe c_msp;
 __constant__ fe c_msm;
@@ -108,6 +130,7 @@ struct FoundRec {
     uint32_t tid;
     uint32_t iter;
     uint32_t pfx; /* which prefix pattern (index into c_target/c_mask) matched */
+    uint32_t w2;  /* wordlist mode: second word (index into g_wordchars), else ~0u */
 };
 
 /* full byte-level check against prefix pattern `p` (needed only for prefixes
@@ -121,6 +144,58 @@ __device__ __forceinline__ bool prefix_full_match(const uint8_t pk[32], int p)
             return false;
     }
     return true;
+}
+
+/* base32 character `i` of the public key: bits 5i..5i+4 of the byte stream,
+   MSB first, matching prefix_to_mask() on the host */
+__device__ __forceinline__ int b32_char(const uint8_t pk[32], int i)
+{
+    int bit = 5 * i;
+    int by = bit >> 3;
+    uint32_t v = (uint32_t)pk[by] << 8;
+    if (by + 1 < 32)
+        v |= pk[by + 1];
+    return (int)((v >> (11 - (bit & 7))) & 31);
+}
+
+/* Stage 2 of the wordlist mode. Pattern `p` matched only a first word, so the
+   characters after it must form a word of the complementary length; on
+   success `w2` names it so the host can rebuild the full prefix. Ordinary
+   patterns pass straight through. Reached only at the stage-1 rate, which is
+   the sum over first words of 32^-len - typically ~1e-6 - so the linear scan
+   of one length bucket is far below the noise floor of the per-candidate
+   curve arithmetic.
+
+   Deliberately __noinline__ and free of any local array: inlined, its
+   register demand joins the search kernels' own allocation, and at 128
+   registers those sit exactly on the sm_86/sm_89 boundary where an SM fits 16
+   warps. Two more registers costs a warp and ~5% throughput on every run,
+   wordlist mode or not, to speed up a branch taken once in a million
+   candidates. Out of line it costs nothing measurable. */
+__device__ __noinline__ bool word_tail_match(const uint8_t pk[32], int p, uint32_t& w2)
+{
+    int ft = c_ftlen[p];
+    w2 = 0xFFFFFFFFu;
+    if (ft == 0)
+        return true;
+    int tl = c_target_len - ft;
+    if (tl < 1 || tl > MAX_WORD_LEN)
+        return false;
+    int end = c_wl_end[tl];
+    for (int w = c_wl_start[tl]; w < end; w++) {
+        bool ok = true;
+        for (int j = 0; j < tl; j++) {
+            if (g_wordchars[w][j] != (uint8_t)b32_char(pk, ft + j)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            w2 = (uint32_t)w;
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Quick reject for the non-lazy kernels (k_search, k_search_mont): y0 is
@@ -360,12 +435,15 @@ __global__ void k_search(ge25519* pts, uint32_t nthreads, uint32_t nbatch,
                 int end = c_bucket_start[bk + 1];
                 for (int i = c_bucket_start[bk]; i < end; i++) {
                     int p = c_bucket_idx[i];
-                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                    uint32_t w2 = 0xFFFFFFFFu;
+                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p) &&
+                        word_tail_match(pk, p, w2)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
                             found[idx].tid = t;
                             found[idx].iter = iter_base + b * BATCH + k;
                             found[idx].pfx = p;
+                            found[idx].w2 = w2;
                         }
                     }
                 }
@@ -440,12 +518,15 @@ __global__ void k_search_mont(MontState* st, uint32_t nthreads, uint32_t nbatch,
                 int end = c_bucket_start[bk + 1];
                 for (int i = c_bucket_start[bk]; i < end; i++) {
                     int p = c_bucket_idx[i];
-                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                    uint32_t w2 = 0xFFFFFFFFu;
+                    if (((y0 ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p) &&
+                        word_tail_match(pk, p, w2)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
                             found[idx].tid = t;
                             found[idx].iter = iter_base + b * BATCH + k;
                             found[idx].pfx = p;
+                            found[idx].w2 = w2;
                         }
                     }
                 }
@@ -531,12 +612,15 @@ __global__ void k_search_mont4(MontState4* __restrict__ st, uint32_t nthreads, u
                 int end = c_bucket_start[bk + 1];
                 for (int i = c_bucket_start[bk]; i < end; i++) {
                     int p = c_bucket_idx[i];
-                    if (((yc ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p)) {
+                    uint32_t w2 = 0xFFFFFFFFu;
+                    if (((yc ^ c_t0[p]) & c_m0[p]) == 0 && prefix_full_match(pk, p) &&
+                        word_tail_match(pk, p, w2)) {
                         uint32_t idx = atomicAdd(found_count, 1);
                         if (idx < MAX_RESULTS) {
                             found[idx].tid = t;
                             found[idx].iter = iter_base + b * BATCH + k;
                             found[idx].pfx = p;
+                            found[idx].w2 = w2;
                         }
                     }
                 }
@@ -607,6 +691,41 @@ static bool load_prefixes_from_file(const std::string& path, std::vector<std::st
         if (mlen < 0 || line.size() > 30) {
             fprintf(stderr, "invalid prefix '%s' at %s:%d (allowed: a-z 2-7, max 30 chars)\n",
                     line.c_str(), path.c_str(), lineno);
+            return false;
+        }
+        out.push_back(line);
+    }
+    return true;
+}
+
+/* Reads a word list, one word per line, with the same lexical rules and the
+   same up-front validation as load_prefixes_from_file - a word is just a
+   prefix that happens to be half of a pair. Kept separate so its errors name
+   the wordlist rather than talking about prefixes. */
+static bool load_words_from_file(const std::string& path, std::vector<std::string>& out)
+{
+    std::ifstream f(path);
+    if (!f) {
+        fprintf(stderr, "cannot open word list '%s'\n", path.c_str());
+        return false;
+    }
+    std::string line;
+    int lineno = 0;
+    while (std::getline(f, line)) {
+        lineno++;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos)
+            continue; /* blank line */
+        line = line.substr(start);
+        for (auto& ch : line)
+            if (ch >= 'A' && ch <= 'Z')
+                ch += 32;
+        uint8_t target[32], mask[32];
+        if (prefix_to_mask(line.c_str(), target, mask) < 0 || line.size() > MAX_WORD_LEN) {
+            fprintf(stderr, "invalid word '%s' at %s:%d (allowed: a-z 2-7, max %d chars)\n",
+                    line.c_str(), path.c_str(), lineno, MAX_WORD_LEN);
             return false;
         }
         out.push_back(line);
@@ -959,6 +1078,14 @@ struct RunConfig {
     double bench_secs;
     bool keep_forever; /* --keep-working-until-ctrlc: never stop on match count */
     bool upload_status; /* --upload-status-per-30min: periodic progress snapshot */
+    /* --use-wordlist-with-normal-list. target_len == 0 means the mode is off,
+       in which case ftlen is all zero and the device skips stage 2 entirely. */
+    int target_len;
+    uint8_t ftlen[MAX_PREFIXES]; /* 0 = plain prefix, else first-word char length */
+    std::vector<std::string> words;  /* every word, ordered by character length */
+    std::vector<uint8_t> wordchars;  /* the same, base32 values, MAX_WORD_LEN per word */
+    int wl_start[32];
+    int wl_end[32];
 };
 
 /* threads-per-block / blocks-per-grid a device will actually launch with,
@@ -1104,6 +1231,12 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
     CUDA_CHECK(cudaMemcpyToSymbol(c_target, cfg.target, sizeof(cfg.target)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_mask, cfg.mask, sizeof(cfg.mask)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_mlen, cfg.mlen, sizeof(cfg.mlen)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_target_len, &cfg.target_len, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_ftlen, cfg.ftlen, sizeof(cfg.ftlen)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_wl_start, cfg.wl_start, sizeof(cfg.wl_start)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_wl_end, cfg.wl_end, sizeof(cfg.wl_end)));
+    if (!cfg.wordchars.empty())
+        CUDA_CHECK(cudaMemcpyToSymbol(g_wordchars, cfg.wordchars.data(), cfg.wordchars.size()));
     CUDA_CHECK(cudaMemcpyToSymbol(c_base, &hostB, sizeof(ge25519)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepp, stepp, sizeof(fe)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_stepm, stepm, sizeof(fe)));
@@ -1261,10 +1394,16 @@ static void run_device(int device, const RunConfig& cfg, std::atomic<int>& globa
                 result_scalar(sc, a0, recs[r].tid, recs[r].iter, T);
                 host_pubkey(pk, sc);
                 std::string addr = onion_address(pk);
-                const std::string* matched = (recs[r].pfx < cfg.prefixes.size())
-                                                  ? &cfg.prefixes[recs[r].pfx]
-                                                  : nullptr;
-                if (!matched || addr.compare(0, matched->size(), *matched) != 0) {
+                /* rebuild the full pattern: in wordlist mode cfg.prefixes[]
+                   holds only the first word and the device reports which word
+                   completed it, so the host still verifies the whole thing */
+                std::string matched;
+                if (recs[r].pfx < cfg.prefixes.size()) {
+                    matched = cfg.prefixes[recs[r].pfx];
+                    if (recs[r].w2 < cfg.words.size())
+                        matched += cfg.words[recs[r].w2];
+                }
+                if (matched.empty() || addr.compare(0, matched.size(), matched) != 0) {
                     std::lock_guard<std::mutex> lk(out_mtx);
                     fprintf(stderr, "WARNING: candidate failed host verification (%s), skipped\n",
                             addr.c_str());
@@ -1318,6 +1457,16 @@ static void usage(const char* argv0)
             "                 lines skipped). Combined with any given on the command\n"
             "                 line. Every line is validated up front; an invalid one\n"
             "                 aborts with its file:line before any GPU work starts.\n"
+            "  --use-wordlist-with-normal-list <wordlist> <len> <normal-list>\n"
+            "                 build prefixes by concatenating two words from\n"
+            "                 <wordlist> so the result is exactly <len> chars.\n"
+            "                 The pairs are never expanded: the GPU matches the\n"
+            "                 first word, then checks the tail against the words\n"
+            "                 of the complementary length, so the effective\n"
+            "                 pattern count is a product and can reach millions.\n"
+            "                 <normal-list> is read exactly like --prefix-from-file\n"
+            "                 and searched alongside. Constraint: the two files\n"
+            "                 have at most %d lines combined.\n"
             "  -b, --bench    run a ~20 second benchmark (no prefix needed)\n"
             "  -d <spec>      CUDA device(s): \"all\" for every visible GPU (default),\n"
             "                 a single index, or a comma list e.g. \"0,1,2\".\n"
@@ -1344,6 +1493,7 @@ static void usage(const char* argv0)
             "  --selftest     run internal tests only\n",
             argv0,
             argv0,
+            MAX_PREFIXES,
             MAX_PREFIXES);
 }
 
@@ -1351,6 +1501,9 @@ int main(int argc, char** argv)
 {
     std::vector<std::string> prefix_args; /* raw positional args, may still hold comma lists */
     std::string prefix_file; /* --prefix-from-file: one prefix per line */
+    /* --use-wordlist-with-normal-list <wordlist> <target len> <normal list> */
+    std::string wl_path, wl_normal_path;
+    int wl_target_len = 0;
     std::string device_arg = "all"; /* single index, comma list ("0,1"), or "all" (default) */
     int tpb = 0, blocks = 0, batch = 512;
     uint32_t iters = 1024;
@@ -1378,6 +1531,11 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--m51")) mode = 1;
         else if (!strcmp(argv[i], "--ext")) mode = 2;
         else if (!strcmp(argv[i], "--prefix-from-file") && i + 1 < argc) prefix_file = argv[++i];
+        else if (!strcmp(argv[i], "--use-wordlist-with-normal-list") && i + 3 < argc) {
+            wl_path = argv[++i];
+            wl_target_len = atoi(argv[++i]);
+            wl_normal_path = argv[++i];
+        }
         else if (argv[i][0] != '-') prefix_args.push_back(argv[i]);
         else {
             usage(argv[0]);
@@ -1393,7 +1551,7 @@ int main(int argc, char** argv)
         printf("selftest OK\n");
         return 0;
     }
-    if (prefix_args.empty() && prefix_file.empty() && !benchmark) {
+    if (prefix_args.empty() && prefix_file.empty() && wl_path.empty() && !benchmark) {
         usage(argv[0]);
         return 1;
     }
@@ -1421,6 +1579,72 @@ int main(int argc, char** argv)
     if (!prefix_file.empty() && !load_prefixes_from_file(prefix_file, raw_prefixes))
         return 1;
 
+    /* --use-wordlist-with-normal-list. The normal list is read exactly like
+       --prefix-from-file. The word list is NOT expanded into pairs: only the
+       words that can be the first half of a target_len pair become device
+       patterns, and the second half is checked on the GPU by word_tail_match.
+       So N device patterns stand for sum over first words of (number of words
+       of the complementary length) real prefixes. A word with no partner of
+       the complementary length is dropped - keeping it would only buy stage-1
+       hits that can never complete. */
+    std::vector<uint8_t> raw_ftlen;    /* per raw_prefixes entry: 0, or first-word length */
+    std::vector<std::string> wl_words; /* every word, ordered by character length */
+    int wl_cnt[32] = {0};              /* words per character length */
+    if (!wl_path.empty()) {
+        if (wl_target_len < 2 || wl_target_len > MAX_WORD_LEN) {
+            fprintf(stderr, "target length must be 2..%d (got %d)\n", MAX_WORD_LEN,
+                    wl_target_len);
+            return 1;
+        }
+        std::vector<std::string> words_raw, normal_raw;
+        if (!load_words_from_file(wl_path, words_raw))
+            return 1;
+        if (!load_prefixes_from_file(wl_normal_path, normal_raw))
+            return 1;
+        if (words_raw.size() + normal_raw.size() > (size_t)MAX_PREFIXES) {
+            fprintf(stderr,
+                    "word list (%zu lines) + normal list (%zu lines) = %zu, over the %d limit\n",
+                    words_raw.size(), normal_raw.size(), words_raw.size() + normal_raw.size(),
+                    MAX_PREFIXES);
+            return 1;
+        }
+
+        /* de-duplicate (a repeated word would otherwise report the same
+           address twice), then order by length so every length occupies one
+           contiguous index range that stage 2 can scan directly */
+        {
+            std::set<std::string> seen;
+            for (const auto& w : words_raw)
+                if (seen.insert(w).second)
+                    wl_words.push_back(w);
+        }
+        std::stable_sort(wl_words.begin(), wl_words.end(),
+                         [](const std::string& a, const std::string& b) {
+                             return a.size() < b.size();
+                         });
+        for (const auto& w : wl_words)
+            wl_cnt[w.size()]++;
+
+        for (const auto& nl : normal_raw)
+            raw_prefixes.push_back(nl);
+        raw_ftlen.assign(raw_prefixes.size(), 0);
+
+        int nfirst = 0;
+        for (const auto& w : wl_words) {
+            int comp = wl_target_len - (int)w.size();
+            if (comp < 1 || comp > MAX_WORD_LEN || wl_cnt[comp] == 0)
+                continue; /* no partner of the complementary length */
+            raw_prefixes.push_back(w);
+            raw_ftlen.push_back((uint8_t)w.size());
+            nfirst++;
+        }
+        if (nfirst == 0) {
+            fprintf(stderr, "no two words in '%s' add up to %d characters\n", wl_path.c_str(),
+                    wl_target_len);
+            return 1;
+        }
+    }
+
     /* benchmark: search a 16-char prefix (expected 32^16 keys - will never
        match) so the per-candidate work is identical to a real search */
     if (benchmark && raw_prefixes.empty())
@@ -1437,7 +1661,23 @@ int main(int argc, char** argv)
     }
 
     /* normalize + validate each prefix */
+    raw_ftlen.resize(raw_prefixes.size(), 0);
     RunConfig cfg{};
+    cfg.target_len = wl_path.empty() ? 0 : wl_target_len;
+    cfg.words = wl_words;
+    {
+        int acc = 0;
+        for (int L = 0; L < 32; L++) {
+            cfg.wl_start[L] = acc;
+            acc += wl_cnt[L];
+            cfg.wl_end[L] = acc;
+        }
+        cfg.wordchars.assign(wl_words.size() * MAX_WORD_LEN, 0);
+        for (size_t i = 0; i < wl_words.size(); i++)
+            for (size_t j = 0; j < wl_words[i].size(); j++)
+                cfg.wordchars[i * MAX_WORD_LEN + j] =
+                    (uint8_t)(strchr(ONION_B32, wl_words[i][j]) - ONION_B32);
+    }
     cfg.nprefixes = (int)raw_prefixes.size();
     for (int p = 0; p < cfg.nprefixes; p++) {
         std::string pfx = raw_prefixes[p];
@@ -1454,6 +1694,7 @@ int main(int argc, char** argv)
         memcpy(cfg.target[p], target, 32);
         memcpy(cfg.mask[p], mask, 32);
         cfg.mlen[p] = mlen;
+        cfg.ftlen[p] = raw_ftlen[p];
         cfg.prefixes.push_back(pfx);
     }
 
@@ -1510,11 +1751,33 @@ int main(int argc, char** argv)
     cfg.keep_forever = keep_forever;
     cfg.upload_status = upload_status;
 
-    /* combined match probability across all prefixes (treated as mutually
-       exclusive, which holds unless prefixes overlap each other) */
-    double prob_sum = 0.0;
-    for (const auto& s : cfg.prefixes)
-        prob_sum += pow(32.0, -(double)s.size());
+    /* Combined match probability across all patterns (treated as mutually
+       exclusive, which holds unless patterns overlap each other). A first-word
+       pattern is not a match on its own: it stands for every target_len pair
+       starting with that word, so it contributes (number of words of the
+       complementary length) * 32^-target_len. stage1_sum is the separate rate
+       at which a pattern fires and pulls its whole warp into the second stage
+       - worth reporting, because short first words make that the dominant cost
+       long before the pattern count does. */
+    double prob_sum = 0.0, stage1_sum = 0.0;
+    uint64_t effective_patterns = 0;
+    int shortest_len = MAX_WORD_LEN + 1, nfirst_words = 0;
+    for (int p = 0; p < cfg.nprefixes; p++) {
+        int plen = (int)cfg.prefixes[p].size();
+        stage1_sum += pow(32.0, -(double)plen);
+        if (plen < shortest_len)
+            shortest_len = plen;
+        if (cfg.ftlen[p] == 0) {
+            prob_sum += pow(32.0, -(double)plen);
+            effective_patterns += 1;
+        } else {
+            int comp = cfg.target_len - (int)cfg.ftlen[p];
+            uint64_t n2 = (uint64_t)(cfg.wl_end[comp] - cfg.wl_start[comp]);
+            prob_sum += (double)n2 * pow(32.0, -(double)cfg.target_len);
+            effective_patterns += n2;
+            nfirst_words++;
+        }
+    }
     double expected = prob_sum > 0.0 ? 1.0 / prob_sum : 0.0;
 
     /* combined startup banner: group devices with identical name/SM count so
@@ -1552,6 +1815,18 @@ int main(int argc, char** argv)
 
         if (benchmark) {
             printf("mode    : benchmark (~%.0f s)\n", bench_secs);
+        } else if (cfg.target_len > 0) {
+            printf("wordlist: %zu words, %d usable as the first half of a %d-char pair\n",
+                   cfg.words.size(), nfirst_words, cfg.target_len);
+            printf("prefixes: %llu effective patterns from %d device patterns"
+                   " (expected ~%.3g keys per match)\n",
+                   (unsigned long long)effective_patterns, cfg.nprefixes, expected);
+            printf("stage 1 : %.3g of candidates reach the word check"
+                   " (shortest pattern %d chars)\n",
+                   stage1_sum, shortest_len);
+            if (stage1_sum > 1e-4)
+                printf("  WARNING: stage 1 fires often - the shortest patterns dominate the\n"
+                       "           cost. Drop the shortest words to get the throughput back.\n");
         } else if (cfg.prefixes.size() == 1) {
             printf("prefix  : %s (expected ~%.3g keys per match)\n", cfg.prefixes[0].c_str(),
                    expected);
